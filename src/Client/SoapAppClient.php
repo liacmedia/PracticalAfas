@@ -100,6 +100,11 @@ class SoapAppClient
             }
         }
 
+        // set default endpoint if not set
+        if(!$options['soap_endpoint']){
+            $options['soap_endpoint'] = 'https://%customerId%.afasonlineconnector.nl/profitservices/%connectorPath%.asmx';
+        }
+
         $options += [
             'soapClientClass' => '\SoapClient',
         ];
@@ -152,7 +157,12 @@ class SoapAppClient
                 $connector_path = 'appconnector' . strtolower($type);
             }
             $env = !empty($this->options['environment']) ? $this->options['environment'] : '';
-            $endpoint = 'https://' . $this->options['customerId'] . ".soap$env.afas.online/profitservices/$connector_path.asmx";
+
+            $endpoint = strtr($this->options['soap_endpoint'], [
+                '%customerId%' => rawurlencode($this->options['customerId']),
+                '%connectorPath%' => $connector_path,
+                '%env%' => $env
+            ]);
         }
 
         if (!empty($this->soapClient)) {

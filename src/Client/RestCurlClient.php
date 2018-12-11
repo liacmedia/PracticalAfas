@@ -100,6 +100,10 @@ class RestCurlClient
                 throw new InvalidArgumentException("Required configuration parameter for $classname missing: $required_key.", 1);
             }
         }
+        // set default endpoint if not set
+        if(!$options['rest_endpoint']){
+            $options['rest_endpoint'] = 'https://%customerId%.afasonlineconnector.nl/ProfitRestServices/%function%';
+        }
 
         // For v1.0 compatibility:
         if (empty($curl_options) && isset($options['curlOptions']) && is_array($options['curlOptions'])) {
@@ -286,7 +290,12 @@ class RestCurlClient
         $env = !empty($this->options['environment']) ? $this->options['environment'] : '';
         // Unlike other input, we don't escape $endpoint (we assume it is safe)
         // because otherwise we can't have slashes in there.
-        $endpoint = 'https://' . rawurlencode($this->options['customerId']) . ".rest$env.afas.online/profitrestservices/$endpoint";
+        $endpoint = strtr($this->options['rest_endpoint'], [
+            '%customerId%' => rawurlencode($this->options['customerId']),
+            '%endpoint%' => $endpoint,
+            '%env%' => $env
+        ]);
+
         if ($arguments) {
             $params = [];
             foreach ($arguments as $key => $value) {

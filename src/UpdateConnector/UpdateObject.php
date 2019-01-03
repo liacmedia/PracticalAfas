@@ -17,8 +17,7 @@ use UnexpectedValueException;
 /**
  * Base class for generating output to send to AFAS Update Connectors.
  *
- * For any object type which has known property definitions (either in this
- * class or in a class that is present in the static $classMap variable),
+ * For any object type which has known property definitions,
  * - An UpdateObject can be create()'d from array of data having a format that
  *   is a little easier to grasp than the JSON structure (and a lot easier than
  *   XML);
@@ -32,8 +31,12 @@ use UnexpectedValueException;
  *   fields and embedded objects, additional full elements, action values) so
  *   an object can be constructed gradually / manipulated.
  *
+ * Classes and field definitions can be overridden using static methods, to
+ * support e.g. custom fields, new object types or modified behavior for
+ * existing object types.
+ *
  * See create() for more information; see the tests/update_examples directory
- * for example array inputs.
+ * for some example array inputs.
  *
  * An UpdateObject can hold data for several elements to send through an
  * Update Connector at once; create() can be called with either the input data
@@ -52,7 +55,9 @@ use UnexpectedValueException;
  * embedded object (again represented by an UpdateObject instance) which can
  * again (depending on the key/object type) contain one or multiple elements.
  *
- * About subclassing: see the comments at $classMap.
+ * About subclassing: see the comments at overrideClass(). Custom fields to
+ * extend standard AFAS objects don't necessarily need subclasssing; see
+ * overridePropertyDefinitions().
  */
 class UpdateObject
 {
@@ -140,44 +145,45 @@ class UpdateObject
     /**
      * A mapping from object type to the class name implementing the type.
      *
-     * Any object types not mentioned here are implemented by this class, or
-     * not implemented.
-     *
-     * Please note that names of object types (the keys in this variable) are
-     * not necessarily equal to the names of 'object reference fields' in
-     * property definitions. See $propertyDefinitions docs for the difference.
-     *
-     * A project which wants to implement custom behavior for specific object
-     * types, or define new object types, can do several things. As an example,
-     * say you want to add a custom field/behavior to KnPerson objects. You can:
-     * - Create a MyPerson class to extend OrgPersonContact (or to extend
-     *   UpdateObject, but the current KnPerson is implemented in
-     *   OrgPersonContact); define the extra field/behavior in
-     *   $propertyDefinitions etc and call 'new MyPerson($values, $action)' to
-     *   get an object representing this type.
-     * - The same but implement multiple overridden objects in the same class
-     *   named e.g. MyUpdateObject, and call
-     *   'new MyUpdateObject($values, $action, "KnPerson")' to get an object.
-     * - The same but set
-     *   UpdateObject::$classMap['KnPerson'] = '\MyProject\MyPerson', and call
-     *   UpdateObject::create('KnPerson, $values, $action) to get an object.
-     * The latter way enables creating custom embedded objects, e.g.
-     * creating a KnContact containing an embedded KnPerson object with the
-     * custom field/behavior. If $classMap is not modified, the embedded object
-     * will be created using the standard class.
-     *
-     * @todo before releasing 2.0, see if we should make this protected and
-     *   add a method to set (change/add) one key + to get the whole thing.
+     * Any object types not in here are implemented by this class, or
+     * not implemented. Extra types can be set using static overrideClass().
      *
      * @var string[]
      */
-    public static $classMap = [
+    protected static $classMap = [
         'FbSales' => '\PracticalAfas\UpdateConnector\FbSales',
+        'FbSalesLines' => '\PracticalAfas\UpdateConnector\FbSalesLines',
         'KnBasicAddress' => '\PracticalAfas\UpdateConnector\KnBasicAddress',
         'KnContact' => '\PracticalAfas\UpdateConnector\OrgPersonContact',
         'KnOrganisation' => '\PracticalAfas\UpdateConnector\OrgPersonContact',
         'KnPerson' => '\PracticalAfas\UpdateConnector\OrgPersonContact',
     ];
+
+    /**
+     * Properties to override per object type.
+     *
+     * Most methods are not supposed to reference this variable; (for speed
+     * reasons) it is the responsibility of a class constructor to merge these
+     * definitions into the propertyDefinitions variable, after which the
+     * variable does not need to be touched anymore.
+     *
+     * It's supposed to be set through overridePropertyDefinitions().
+     * Keys/values in this variable are that method's first/second arguments.
+     *
+     * @var array[]
+     */
+    protected static $definitionOverrides = [];
+
+
+    /**
+     * Field properties to override per object type + field.
+     *
+     * It's supposed to be set through overrideFieldProperty(). The caveats for
+     * $definitionOverrides also apply here.
+     *
+     * @var array[]
+     */
+    protected static $fieldOverrides = [];
 
     /**
      * The type of object (and the name of the corresponding Update Connector).
@@ -210,11 +216,14 @@ class UpdateObject
      * no getter). The constructor is responsible for populating it, if it is
      * not already populated in the class definition.
      *
-     * Code may also manipulate properties to influence the validation process
+     * Code may also modify properties to influence the validation process
      * but must then obviously be very careful to ensure that all validation
-     * works uniformly. (This can be tricky / requires knowledge of exactly
-     * when which types of validation are performed, as it can happen during
-     * addElements(), setField() and validateElement() calls.)
+     * works uniformly. (This requires knowledge of exactly when which types of
+     * validation is performed by which method: validation happen during both
+     * validateElementInput() and validateElement() calls, which each have a
+     * slightly different function and each call a number of other methods. to
+     * do the work.) These modifications are not guaranteed to persist after
+     * validation.
      *
      * The format is not related to AFAS but a structure specific to this class.
      * The array has the following keys:
@@ -256,7 +265,12 @@ class UpdateObject
      *                 value must be an array of element(s) values.
      *   - 'required': See 'fields' above.
      *
-     * Child classes may define extra properties and handle those at will.
+     * For examples, see setPropertyDefinitions().
+     *
+     * Child classes may define extra properties and handle those at will. They
+     * should take into account that their properties could contain any value,
+     * or alternatively implement strict checking in their constructor, because
+     * values can be overridden using overridePropertyDefinitions(),
      *
      * About 'object reference fields': these are the names as found in e.g.
      * XSD schemas for a certain Update Connector. These are not necessarily
@@ -295,6 +309,229 @@ class UpdateObject
     protected $elements = [];
 
     /**
+     * Sets a custom class to use for a specific object type.
+     *
+     * This is necessary if you want to use the static create() method for
+     * creating customized objects. This is recommended, though not required.
+     *
+     * A project which wants to implement custom behavior for specific object
+     * types, or define new object types, can do several things. As an example,
+     * adding a custom field/behavior to KnContact objects can be done by:
+     * - Creating a MyPerson class to extend OrgPersonContact (or to extend
+     *   UpdateObject, but the current KnContact is implemented in
+     *   OrgPersonContact); define the extra field/behavior in
+     *   setPropertyDefinitions() etc and call 'new MyContact($values, $action)'
+     *   to get an object representing this type.
+     * - The same but implement multiple overridden objects in the same class
+     *   named e.g. MyUpdateObject, and call
+     *   'new MyUpdateObject($values, $action, "KnContact")' to get an object.
+     * - The same but call
+     *   UpdateObject::overrideClass('KnContact', '\...\MyPerson'); then call
+     *   UpdateObject::create('KnContact, $values, $action) to get an object.
+     *
+     * The latter way enables creating custom embedded objects, e.g.
+     * creating a KnPerson containing an embedded KnContact object with the
+     * custom field/behavior. If overrideClass() is not called, the embedded
+     * object will be created using the standard OrgPersonContact class.
+     *
+     * Note that for only adding/overriding field definitions (to e.g. support
+     * custom fields), it is not necessary to implement a custom class. This
+     * can be done by calling overridePropertyDefinitions() instead.
+     *
+     * @param string $object_type
+     *   The object type. Please note that names of object types are not always
+     *   (although often) equal to the names of 'object reference fields' in
+     *   property definitions. See $propertyDefinitions for the difference.
+     * @param string|null $class
+     *   The class which should implement this object type, starting with '\'.
+     *   Null to remove the override for this object type, falling back to the
+     *   standard definition inside whichever class' create() method is called.
+     *
+     * @throws \InvalidArgumentException
+     *   If any of the arguments are not a string or the class does not exist /
+     *   cannot be autoloaded.
+     *
+     * @see overridePropertyDefinitions()
+     * @see $classMap
+     * @see $propertyDefinitions
+     */
+    public static function overrideClass($object_type, $class)
+    {
+        if (!is_string($object_type)) {
+            throw new InvalidArgumentException('$object_type argument is not a string.');
+        }
+        if (!is_string($class) && isset($class)) {
+            throw new InvalidArgumentException('$class argument is not a string.');
+        }
+        if (!class_exists($class)) {
+            throw new InvalidArgumentException("$class class does not exist.");
+        }
+
+        if (isset($class)) {
+            self::$classMap[$object_type] = $class;
+        } else {
+            unset(self::$classMap[$object_type]);
+        }
+    }
+
+    /**
+     * Returns the almost-full mapping from object type to implementing class.
+     *
+     * Any object types not in here are supposedly implemented by UpdateObject.
+     *
+     * @return string[]
+     */
+    public static function getClassMap() {
+        return self::$classMap;
+    }
+
+    /**
+     * Overrides property definitions for a specific object type.
+     *
+     * The anticipated use of this is defining custom fields for existing
+     * types. Whether calling this method has effect, relies on (constructor)
+     * code in the class which implements the object type. Definitions in
+     * classes which are already instantiated are not affected (with the
+     * possible exception of custom child classes handling these overrides in a
+     * non-standard way).
+     *
+     * Overrides set through this method have no effect on overrides set
+     * through overrideFieldProperty() (which take precedence) or on properties
+     * set dynamically set by custom classes' own code (typically during
+     * validation).
+     *
+     * @param string $object_type
+     *   The object type. Please note that names of object types are not always
+     *   (although often) equal to the names of 'object reference fields' in
+     *   property definitions. See $propertyDefinitions for the difference.
+     * @param array $definitions
+     *   The definitions that will override any standard definitions set by
+     *   the constructor. If any earlier overrides were already set for this
+     *   type, they will be overwritten. (This means it is not allowed to set
+     *   overrides for one type from multiple sources, because it's not known
+     *   if those overrides will conflict. It also means that all necessary
+     *   overrides for a certain types must be set in one call.) The structure
+     *   is the same as property definitions: field definitions must be keyed
+     *   by 'fields' and then the AFAS field name; object reference field
+     *   definitions must be keyed by 'objects' and then the reference field
+     *   name. The individual (reference) field definitions must be arrays or
+     *   null. Arrays must be complete definitions: if a field definition
+     *   already exists, it will be completely overwritten by this override
+     *   definition, not merged. A null value will remove the original field
+     *   definition. Other custom values on the first level of this array (i.e.
+     *   on the same level as 'fields' and 'objects') are seen as individual
+     *   property definitions that will also completely replace a property if
+     *   that exists already; these property definitions don't have to be
+     *   arrays. A null value will also remove any original property definition
+     *   (rather than set it to null).
+     *
+     * @throws \InvalidArgumentException
+     *   If any of the arguments are invalid.
+     *
+     * @see $propertyDefinitions
+     * @see overrideFieldProperty()
+     */
+    public static function overridePropertyDefinitions($object_type, array $definitions)
+    {
+        if (!is_string($object_type)) {
+            throw new InvalidArgumentException('$object_type argument is not a string.');
+        }
+        if ($definitions) {
+            // Validate definitions. (We will also do this in the constructor
+            // but it seems best to throw exceptions as early as possible.)
+            static::validateDefinitionOverrides($definitions);
+            self::$definitionOverrides[$object_type] = $definitions;
+        } else {
+            unset(self::$definitionOverrides[$object_type]);
+        }
+    }
+
+    /**
+     * Returns the property definition overrides per object type.
+     *
+     * @return array[]
+     */
+    public static function getPropertyDefinitionOverrides()
+    {
+        return self::$definitionOverrides;
+    }
+
+    /**
+     * Overrides a property definition for a specific field in an object type.
+     *
+     * The anticipated use of this is overriding properties like 'alias' or
+     * 'required' for individual fields without caring about other properties.
+     * This also overrides any definitions set through
+     * overridePropertyDefinitions(). The difference with that function is,
+     * this only changes a single field property while leaving the other
+     * properties intact.
+     *
+     * See the caveats outlined in overridePropertyDefinitions() which also
+     * apply here.
+     *
+     * @param string $object_type
+     *   The object type. Please note that names of object types are not always
+     *   (although often) equal to the names of 'object reference fields' in
+     *   property definitions. See $propertyDefinitions for the difference.
+     * @param string $field_name
+     *   The field name within the object type.
+     * @param string $property
+     *   The property name within the field.
+     * @param mixed $value
+     *   The value to set.
+     *
+     * @see overridePropertyDefinitions()
+     * @see unOverrideFieldProperty()
+     */
+    public static function overrideFieldProperty($object_type, $field_name, $property, $value)
+    {
+        self::$fieldOverrides[$object_type][$field_name][$property] = $value;
+    }
+
+    /**
+     * Removes property override(s) for an object type and/or field/property.
+     *
+     * This does not affect definitions set through
+     * overridePropertyDefinitions().
+     *
+     * @param string $object_type
+     *   The object type. Please note that names of object types are not always
+     *   (although often) equal to the names of 'object reference fields' in
+     *   property definitions. See $propertyDefinitions for the difference.
+     * @param string $field_name
+     *   (Optional) The field name within the object type. Leave empty to
+     *   remove all overrides for this object type.
+     * @param string $property
+     *   (Optional) The property name within the field. Leave empty to remove
+     *   all overrides for this object type + field.
+     *
+     * @see overrideFieldProperty()
+     */
+    public static function unOverrideFieldProperty($object_type, $field_name = '', $property = '')
+    {
+        if (empty($field_name)) {
+            if (!empty($property)) {
+                throw new InvalidArgumentException("Field name may not be empty if property name is not empty.");
+            }
+            unset(self::$fieldOverrides[$object_type]);
+        } elseif (empty($property)) {
+            unset(self::$fieldOverrides[$object_type][$field_name]);
+        } else {
+            unset(self::$fieldOverrides[$object_type][$field_name][$property]);
+        }
+    }
+
+    /**
+     * Returns the field property overrides per object type + field + property.
+     *
+     * @return array[]
+     */
+    public static function getFieldPropertyOverrides()
+    {
+        return self::$fieldOverrides;
+    }
+
+    /**
      * Instantiates a new UpdateObject, or a class defined in our map.
      *
      * One thing to remember for the $action argument: when wanting to use this
@@ -304,9 +541,20 @@ class UpdateObject
      * to passing nothing. (Yes this is a messy argument; @see setAction() if
      * you really want to know reasons.)
      *
+     * Valid names and aliases for fields (and 'object reference fields') for
+     * each object type are set in the protected $propertyDefinitions variable
+     * of the appropriate class. In this base class, these are set in
+     * setPropertyDefinitions() so can be found there. Other classes may do the
+     * same, define them in __construct() or in $propertyDefinitions directly.
+     * Definitions can however also be overridden and/or extra ones can be
+     * added, in child classes or through static overridePropertyDefinitions().
+     *
      * @param string $type
      *   The type of object, i.e. the 'Update Connector' name to send this data
-     *   into. Possible values can be found in $classMap and __construct().
+     *   into. Possible values can be found in the property definitions (i.e.
+     *   in setPropertyDefinitions() of this base class) or in the $classMap
+     *   variable. Extra ones can however also be added through static
+     *   overrideClass().
      * @param array $elements
      *   (Optional) Data to set in the UpdateObject, representing one or more
      *   elements of this type; see the definitions in __construct() or child
@@ -314,17 +562,23 @@ class UpdateObject
      *   elements if all keys are numeric and all values are arrays (or if the
      *   value is a single empty array, meaning zero elements); it's processed
      *   as a single element otherwise. Keys inside a single element can be:
-     *   - field names or aliases (as defined in __construct() / child classes);
-     *   - names or aliases of the 'object reference fields' (see
-     *     $propertyDefinitions)  which can be embedded into this object
-     *     type; the values must be an array of data (one or multiple elements)
-     *     to set in that object, or an UpdateObject;
+     *   - field names or aliases;
+     *   - names or aliases of the 'object reference fields' (see comments at
+     *     $propertyDefinitions)  which can be embedded into this object type;
+     *     the values must be an array of data (one or multiple elements) to
+     *     set in that object;
      *   - '@xxId' (where xx is a type-specific two letter code) or '@id', which
      *     holds the 'ID value' for an element. (In the output, this ID value is
      *     located in the Element structure the same level as the Fields, rather
      *     than inside Fields. Or in XML: it's an attribute in the Element tag.)
-     *   The names for fields and objects can either all be on the same level,
-     *   or nested in a 'Fields' and 'Objects' array.
+     *   The fields and objects can either all be present in the first dimension
+     *   of the array, or be present in a 'Fields' and/or 'Objects' array. In
+     *   the latter case, the first dimension of the array must not contain any
+     *   keys other than 'Fields', 'Objects' and the ID property. In addition,
+     *   this latter standalone structure can also be wrapped in a one-element
+     *   array with key 'Element' - and also, this again wrapped into a
+     *   one-element array being the object type. (Reason: this is equal to the
+     *   structure of the REST API's JSON messages, so we also accept that.)
      * @param string $action
      *   (Optional) The action to perform on the data: "insert", "update" or
      *   "delete". @see setAction() or the comments above.
@@ -349,24 +603,67 @@ class UpdateObject
      * @return static
      *
      * @throws \InvalidArgumentException
-     *   If any argument is invalid or he element data contains invalid values.
-     * @throws \OutOfBoundsException
-     *   If the element data contains unknown field/object names.
+     *   If any argument is invalid or he element data contains invalid values
+     *   or unknown field/object names.
      * @throws \UnexpectedValueException
      *   If this object's defined properties are invalid.
      *
-     * @see $propertyDefinitions
      * @see __construct()
      * @see output()
+     * @see overrideClass()
      */
-    public static function create($type, array $elements = [], $action = '', $validation_behavior = self::VALIDATE_ESSENTIAL, $parent_type = '') {
+    public static function create($type, array $elements = [], $action = '', $validation_behavior = self::VALIDATE_ESSENTIAL, $parent_type = '')
+    {
         // If a custom class is defined for this type, instantiate that one.
-        if (isset(static::$classMap[$type])) {
-            return new static::$classMap[$type]($elements, $action, $type, $validation_behavior, $parent_type);
+        // (Note to self: self::$classMap and static::$classMap are exactly the
+        // same here, because the variable is defined as static.)
+        if (isset(self::$classMap[$type])) {
+            return new self::$classMap[$type]($elements, $action, $type, $validation_behavior, $parent_type);
         }
-        // Use self(); static() yields errors when a child class creates a new
-        // embedded object which is defined in this base class.
+        // Otherwise instantiate this class. (self(), not static(); if a
+        // child class creates a new embedded object of a type not defined in
+        // self::$classMap, it should create an instance of UpdateObject, not
+        // of itself.)
         return new self($elements, $action, $type, $validation_behavior, $parent_type);
+    }
+
+    /**
+     * Validates and/or merges 'property definitions overrides'.
+     *
+     * @param array $definition_overrides
+     *   The definitions for one type, as it is / should be stored in
+     *   $definitionOverrides.
+     *
+     * @throws \InvalidArgumentException
+     *   If the definition overrides are invalid.
+     */
+    protected static function validateDefinitionOverrides(array $definition_overrides)
+    {
+        // Validate the overrides for 'fields' and 'objects'; change or unset
+        // definitions where necessary.
+        $errors = [];
+        foreach (['fields', 'objects'] as $subtype) {
+            if (isset($definition_overrides[$subtype])) {
+                // The array itself may only be an array (of objects/fields).
+                // Empty is OK; that will fall through without doing anything.
+                if (!is_array($definition_overrides[$subtype])) {
+                    $errors[] = "'$subtype' definition override is not an array.";
+                } else {
+                    // Each field definition must be an array or null. Merge or
+                    // unset depending on the value.
+                    foreach ($definition_overrides[$subtype] as $name => $value) {
+                        if (isset($value)) {
+                            if (!is_array($value)) {
+                                $errors[] = "'$name' $subtype definition override is not an array.";
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if ($errors) {
+            throw new InvalidArgumentException(implode("\n", $errors));
+        }
     }
 
     /**
@@ -396,636 +693,20 @@ class UpdateObject
      */
     public function __construct(array $elements = [], $action = '', $type = '', $validation_behavior = self::VALIDATE_ESSENTIAL, $parent_type = '')
     {
-        if (empty($this->propertyDefinitions)) {
-            // Below definitions are based on what AFAS calls the 'XSD Schema'
-            // for SOAP, retrieved though a Data Connector in november 2014.
-            // They're amended with extra info like more understandable aliases
-            // for the field names, and default values. There are lots of Dutch
-            // comment lines in this function; these were gathered from an
-            // online knowledge base page around 2012 when that was the only
-            // form/language of documentation.
-            switch ($type) {
-                case 'KnSalesRelationPer':
-                    // [ Contains notes from 2014, based on an example XML snippet
-                    //   from 2011 which I inherited from a commerce system. Please
-                    //   send PRs to fix the fields / comments if you feel inclined. ]
-                    // NOTE - not checked against XSD yet, only taken over from Qoony example
-                    // Fields:
-                    // ??? = Overheids Identificatienummer, which an AFAS expert recommended
-                    //       for using as a secondary-unique-id, when we want to insert an
-                    //       auto-numbered object and later retrieve it to get the inserted ID.
-                    //       I don't know what this is but it's _not_ 'OIN', I tried that.
-                    //       (In the end we never used this field.)
-                    $this->propertyDefinitions = [
-                        'id_property' => 'DbId',
-                        'objects' => [
-                            'KnPerson' => [
-                                'alias' => 'person',
-                            ],
-                        ],
-                        'fields' => [
-                            // 'is debtor'?
-                            'IsDb' => [
-                                'type' => 'boolean',
-                                'default' => true,
-                            ],
-                            // According to AFAS docs, PaCd / VaDu "are required
-                            // if IsDb==True" ... no further specs.
-                            // [ comment 2014: ]
-                            // Heh, VaDu is not even in our inserted XML so
-                            // that does not seem to be actually true.
-                            'PaCd' => [
-                                'default' => '14',
-                            ],
-                            'CuId' => [
-                                'alias' => 'currency_code',
-                                'default' => 'EUR',
-                            ],
-                            'Bl' => [
-                                'default' => 'false',
-                            ],
-                            'AuPa' => [
-                                'default' => '0',
-                            ],
-                            // Verzamelrekening Debiteur -- apparently these
-                            // just need to be specified by whoever is setting
-                            // up the AFAS administration?
-                            'ColA' => [
-                                'alias' => 'verzamelreking_debiteur',
-                            ],
-                            // [ comment 2014: ]
-                            // ?? Doesn't seem to be required, but we're still
-                            // setting default to the old value we're used to,
-                            // until we know what this field means.
-                            'VtIn' => [
-                                'default' => '1',
-                            ],
-                            'PfId' => [
-                                'default' => '*****',
-                            ],
-                        ],
-                    ];
-                    break;
-
-                case 'KnSubject':
-                    $this->propertyDefinitions = [
-                        'id_property' => 'SbId',
-                        // See definition of KnS01: I'm not sure if this is correct.
-                        'objects' => [
-                            'KnSubjectLink' => [
-                                'alias' => 'subject_link',
-                            ],
-                            'KnS01' => [
-                                'alias' => 'subject_link_1',
-                            ],
-                            'KnS02' => [
-                                'alias' => 'subject_link_2',
-                            ],
-                            // If there are more KnSNN, they have all custom fields?
-                        ],
-                        'fields' => [
-                            // Type dossieritem (verwijzing naar: Type dossieritem => AfasKnSubjectType)
-                            'StId' => [
-                                'alias' => 'type',
-                                'type' => 'integer',
-                                'required' => true,
-                            ],
-                            // Onderwerp
-                            'Ds' => [
-                                'alias' => 'description',
-                            ],
-                            // Toelichting
-                            'SbTx' => [
-                                'alias' => 'comment',
-                            ],
-                            // Instuurdatum
-                            'Da' => [
-                                'alias' => 'date',
-                                'type' => 'date',
-                            ],
-                            // Verantwoordelijke (verwijzing naar: Medewerker => AfasKnEmployee)
-                            'EmId' => [
-                                'alias' => 'responsible',
-                            ],
-                            // Aanleiding (verwijzing naar: Dossieritem => AfasKnSubject)
-                            'SbHi' => [
-                                'type' => 'integer',
-                            ],
-                            // Type actie (verwijzing naar: Type actie => AfasKnSubjectActionType)
-                            'SaId' => [
-                                'alias' => 'action_type',
-                            ],
-                            // Prioriteit (verwijzing naar: Tabelwaarde,Prioriteit actie => AfasKnCodeTableValue)
-                            'ViPr' => [],
-                            // Bron (verwijzing naar: Brongegevens => AfasKnSourceData)
-                            'ScId' => [
-                                'alias' => 'source',
-                            ],
-                            // Begindatum
-                            'DtFr' => [
-                                'alias' => 'start_date',
-                                'type' => 'date',
-                            ],
-                            // Einddatum
-                            'DtTo' => [
-                                'alias' => 'end_date',
-                                'type' => 'date',
-                            ],
-                            // Afgehandeld
-                            'St' => [
-                                'alias' => 'done',
-                                'type' => 'boolean',
-                            ],
-                            // Datum afgehandeld
-                            'DtSt' => [
-                                'alias' => 'done_date',
-                                'type' => 'date',
-                            ],
-                            // Waarde kenmerk 1 (verwijzing naar: Waarde kenmerk => AfasKnFeatureValue)
-                            'FvF1' => [
-                                'type' => 'integer',
-                            ],
-                            // Waarde kenmerk 2 (verwijzing naar: Waarde kenmerk => AfasKnFeatureValue)
-                            'FvF2' => [
-                                'type' => 'integer',
-                            ],
-                            // Waarde kenmerk 3 (verwijzing naar: Waarde kenmerk => AfasKnFeatureValue)
-                            'FvF3' => [
-                                'type' => 'integer',
-                            ],
-                            // Geblokkeerd
-                            'SbBl' => [
-                                'alias' => 'blocked',
-                                'type' => 'boolean',
-                            ],
-                            // Bijlage
-                            'SbPa' => [
-                                'alias' => 'attachment',
-                            ],
-                            // Save file with subject
-                            'FileTrans' => [
-                                'type' => 'boolean',
-                            ],
-                            // File as byte-array
-                            'FileStream' => [],
-                        ],
-                    ];
-                    break;
-
-                case 'KnSubjectLink':
-                    $this->propertyDefinitions = [
-                        'id_property' => 'SbId',
-                        'fields' => [
-                            // Save in CRM Subject
-                            'DoCRM' => [
-                                'type' => 'boolean',
-                            ],
-                            // Organisatie/persoon
-                            'ToBC' => [
-                                'alias' => 'is_org_person',
-                                'type' => 'boolean',
-                            ],
-                            // Medewerker
-                            'ToEm' => [
-                                'alias' => 'is_employee',
-                                'type' => 'boolean',
-                            ],
-                            // Verkooprelatie
-                            'ToSR' => [
-                                'alias' => 'is_sales_relation',
-                                'type' => 'boolean',
-                            ],
-                            // Inkooprelatie
-                            'ToPR' => [
-                                'alias' => 'is_purchase_relation',
-                                'type' => 'boolean',
-                            ],
-                            // Cliënt IB
-                            'ToCl' => [
-                                'alias' => 'is_client_ib',
-                                'type' => 'boolean',
-                            ],
-                            // Cliënt Vpb
-                            'ToCV' => [
-                                'alias' => 'is_client_vpb',
-                                'type' => 'boolean',
-                            ],
-                            // Werkgever
-                            'ToEr' => [
-                                'alias' => 'is_employer',
-                                'type' => 'boolean',
-                            ],
-                            // Sollicitant
-                            'ToAp' => [
-                                'alias' => 'is_applicant',
-                                'type' => 'boolean',
-                            ],
-                            // Type bestemming
-                            // Values:  1:Geen   2:Medewerker   3:Organisatie/persoon   4:Verkooprelatie   8:Cliënt IB   9:Cliënt Vpb   10:Werkgever   11:Inkooprelatie   17:Sollicitant   30:Campagne   31:Item   32:Cursusevenement-->
-                            'SfTp' => [
-                                'alias' => 'destination_type',
-                                'type' => 'integer',
-                            ],
-                            // Bestemming
-                            'SfId' => [
-                                'alias' => 'destination_id',
-                            ],
-                            // Organisatie/persoon (verwijzing naar: Organisatie/persoon => AfasKnBasicContact)
-                            'BcId' => [
-                                'alias' => 'org_person',
-                            ],
-                            // Contact (verwijzing naar: Contact => AfasKnContactData)
-                            'CdId' => [
-                                'alias' => 'contact',
-                                'type' => 'integer',
-                            ],
-                            // Administratie (Verkoop) (verwijzing naar: Administratie => AfasKnUnit)
-                            'SiUn' => [
-                                'type' => 'integer',
-                            ],
-                            // Factuurtype (verkoop) (verwijzing naar: Type factuur => AfasFiInvoiceType)
-                            'SiTp' => [
-                                'alias' => 'sales_invoice_type',
-                                'type' => 'integer',
-                            ],
-                            // Verkoopfactuur (verwijzing naar: Factuur => AfasFiInvoice)
-                            'SiId' => [
-                                'alias' => 'sales_invoice',
-                            ],
-                            // Administratie (Inkoop) (verwijzing naar: Administratie => AfasKnUnit)
-                            'PiUn' => [
-                                'type' => 'integer',
-                            ],
-                            // Factuurtype (inkoop) (verwijzing naar: Type factuur => AfasFiInvoiceType)
-                            'PiTp' => [
-                                'alias' => 'purchase_invoice_type',
-                                'type' => 'integer',
-                            ],
-                            // Inkoopfactuur (verwijzing naar: Factuur => AfasFiInvoice)
-                            'PiId' => [
-                                'alias' => 'purchase_invoice',
-                            ],
-                            // Fiscaal jaar (verwijzing naar: Aangiftejaren => AfasTxDeclarationYear)
-                            'FiYe' => [
-                                'alias' => 'fiscal_year',
-                                'type' => 'integer',
-                            ],
-                            // Project (verwijzing naar: Project => AfasPtProject)
-                            'PjId' => [
-                                'alias' => 'project',
-                            ],
-                            // Campagne (verwijzing naar: Campagne => AfasCmCampaign)
-                            'CaId' => [
-                                'alias' => 'campaign',
-                                'type' => 'integer',
-                            ],
-                            // Actief (verwijzing naar: Vaste activa => AfasFaFixedAssets)
-                            'FaSn' => [
-                                'type' => 'integer',
-                            ],
-                            // Voorcalculatie (verwijzing naar: Voorcalculatie => AfasKnQuotation)
-                            'QuId' => [],
-                            // Dossieritem (verwijzing naar: Dossieritem => AfasKnSubject)
-                            'SjId' => [
-                                'type' => 'integer',
-                            ],
-                            // Abonnement (verwijzing naar: Abonnement => AfasFbSubscription
-                            'SuNr' => [
-                                'alias' => 'subscription',
-                                'type' => 'integer',
-                            ],
-                            // Dienstverband
-                            'DvSn' => [
-                                'type' => 'integer',
-                            ],
-                            // Type item (verwijzing naar: Tabelwaarde,Itemtype => AfasKnCodeTableValue)
-                            // Values:  Wst:Werksoort   Pid:Productie-indicator   Deg:Deeg   Dim:Artikeldimensietotaal   Art:Artikel   Txt:Tekst   Sub:Subtotaal   Tsl:Toeslag   Kst:Kosten   Sam:Samenstelling   Crs:Cursus-->
-                            'VaIt' => [
-                                'alias' => 'item_type',
-                            ],
-                            // Itemcode (verwijzing naar: Item => AfasFbBasicItems)
-                            'BiId' => [
-                                'alias' => 'item_code',
-                            ],
-                            // Cursusevenement (verwijzing naar: Evenement => AfasKnCourseEvent)
-                            'CrId' => [
-                                'alias' => 'course_event',
-                                'type' => 'integer',
-                            ],
-                            // Verzuimmelding (verwijzing naar: Verzuimmelding => AfasHrAbsIllnessMut)
-                            'AbId' => [
-                                'type' => 'integer',
-                            ],
-                            // Forecast (verwijzing naar: Forecast => AfasCmForecast)
-                            'FoSn' => [
-                                'type' => 'integer',
-                            ],
-                        ],
-                    ];
-                    break;
-
-                // I do not know if the following is correct: back in 2014, the
-                // XSD schema / Data Connector contained separate explicit
-                // definitions for KnS01 and KnS02, which suggested they are
-                // separate object types with defined fields, even though their
-                // fields all start with 'U'. I can imagine that the XSD
-                // contained just examples and actually it is up to the AFAS
-                // environment to define these. In that case, the following
-                // definitions should be removed from here and KnS01 should be
-                // implemented (and the corresponding 'object reference fields'
-                // in KnSubject should be overridden) in custom classes.
-                case 'KnS01':
-                    $this->propertyDefinitions = [
-                        'id_property' => 'SbId',
-                        'fields' => [
-                            // Vervaldatum
-                            'U001' => [
-                                'alias' => 'end_date',
-                                'type' => 'date',
-                            ],
-                            // Identiteitsnummer
-                            'U002' => [
-                                'alias' => 'id_number',
-                            ],
-                        ],
-                    ];
-                    break;
-
-                case 'KnS02':
-                    $this->propertyDefinitions = [
-                        'id_property' => 'SbId',
-                        'fields' => [
-                            // Contractnummer
-                            'U001' => [
-                                'alias' => 'contract_number',
-                            ],
-                            // Begindatum contract
-                            'U002' => [
-                                'alias' => 'start_date',
-                                'type' => 'date',
-                            ],
-                            // Einddatum contract
-                            'U003' => [
-                                'alias' => 'start_date',
-                                'type' => 'date',
-                            ],
-                            // Waarde
-                            'U004' => [
-                                'alias' => 'value',
-                                'type' => 'decimal',
-                            ],
-                            // Beëindigd
-                            'U005' => [
-                                'alias' => 'ended',
-                                'type' => 'boolean',
-                            ],
-                            // Stilzwijgend verlengen
-                            'U006' => [
-                                'alias' => 'recurring',
-                                'type' => 'boolean',
-                            ],
-                            // Opzegtermijn (verwijzing naar: Tabelwaarde,(Afwijkende) opzegtermijn => AfasKnCodeTableValue)
-                            'U007' => [
-                                'alias' => 'cancel_term',
-                            ],
-                        ],
-                    ];
-                    break;
-
-                case 'FbSalesLines':
-                    $this->propertyDefinitions = [
-                        'objects' => [
-                            'FbOrderBatchLines' => [
-                                'alias' => 'batch_line_items',
-                                'multiple' => true,
-                            ],
-                            'FbOrderSerialLines' => [
-                                'alias' => 'serial_line_items',
-                                'multiple' => true,
-                            ],
-                        ],
-                        'fields' => [
-                            // Type item (verwijzing naar: Tabelwaarde,Itemtype => AfasKnCodeTableValue)
-                            // Values:  1:Werksoort   10:Productie-indicator   11:Deeg   14:Artikeldimensietotaal   2:Artikel   3:Tekst   4:Subtotaal   5:Toeslag   6:Kosten   7:Samenstelling   8:Cursus
-                            'VaIt' => [
-                                'alias' => 'item_type',
-                            ],
-                            // Itemcode
-                            'ItCd' => [
-                                'alias' => 'item_code',
-                            ],
-                            // Omschrijving
-                            'Ds' => [
-                                'alias' => 'description',
-                            ],
-                            // Btw-tariefgroep (verwijzing naar: Btw-tariefgroep => AfasKnVatTarifGroup)
-                            'VaRc' => [
-                                'alias' => 'vat_type',
-                            ],
-                            // Eenheid (verwijzing naar: Eenheid => AfasFbUnit)
-                            'BiUn' => [
-                                'alias' => 'unit_type',
-                            ],
-                            // Aantal eenheden
-                            'QuUn' => [
-                                'alias' => 'quantity',
-                                'type' => 'decimal',
-                            ],
-                            // Lengte
-                            'QuLe' => [
-                                'alias' => 'length',
-                                'type' => 'decimal',
-                            ],
-                            // Breedte
-                            'QuWi' => [
-                                'alias' => 'width',
-                                'type' => 'decimal',
-                            ],
-                            // Hoogte
-                            'QuHe' => [
-                                'alias' => 'height',
-                                'type' => 'decimal',
-                            ],
-                            // Aantal besteld
-                            'Qu' => [
-                                'alias' => 'quantity_ordered',
-                                'type' => 'decimal',
-                            ],
-                            // Aantal te leveren
-                            'QuDl' => [
-                                'alias' => 'quantity_deliver',
-                                'type' => 'decimal',
-                            ],
-                            // Prijslijst (verwijzing naar: Prijslijst verkoop => AfasFbPriceListSale)
-                            'PrLi' => [
-                                'alias' => 'price_list',
-                            ],
-                            // Magazijn (verwijzing naar: Magazijn => AfasFbWarehouse)
-                            'War' => [
-                                'alias' => 'warehouse',
-                            ],
-                            // Dienstenberekening
-                            'EUSe' => [
-                                'type' => 'boolean',
-                            ],
-                            // Gewichtseenheid (verwijzing naar: Tabelwaarde,Gewichtseenheid => AfasKnCodeTableValue)
-                            // Values:  0:Geen gewicht   1:Microgram (Âµg)   2:Milligram (mg)   3:Gram (g)   4:Kilogram (kg)   5:Ton
-                            'VaWt' => [
-                                'alias' => 'weight_unit',
-                            ],
-                            // Nettogewicht
-                            'NeWe' => [
-                                'alias' => 'weight_net',
-                                'type' => 'decimal',
-                            ],
-                            //
-                            'GrWe' => [
-                                'alias' => 'weight_gross',
-                                'type' => 'decimal',
-                            ],
-                            // Prijs per eenheid
-                            'Upri' => [
-                                'alias' => 'unit_price',
-                                'type' => 'decimal',
-                            ],
-                            // Kostprijs
-                            'CoPr' => [
-                                'alias' => 'cost_price',
-                                'type' => 'decimal',
-                            ],
-                            // Korting toestaan (verwijzing naar: Tabelwaarde,Toestaan korting => AfasKnCodeTableValue)
-                            // Values:  0:Factuur- en regelkorting   1:Factuurkorting   2:Regelkorting   3:Geen factuur- en regelkorting
-                            'VaAD' => [],
-                            // % Regelkorting
-                            'PRDc' => [
-                                'type' => 'decimal',
-                            ],
-                            // Bedrag regelkorting
-                            'ARDc' => [
-                                'type' => 'decimal',
-                            ],
-                            // Handmatig bedrag regelkorting
-                            'MaAD' => [
-                                'type' => 'boolean',
-                            ],
-                            // Opmerking
-                            'Re' => [
-                                'alias' => 'comment',
-                            ],
-                            // GUID regel
-                            'GuLi' => [
-                                'alias' => 'guid',
-                            ],
-                            // Artikeldimensiecode 1 (verwijzing naar: Artikeldimensiecodes => AfasFbStockDimLines)
-                            'StL1' => [
-                                'alias' => 'dimension_1',
-                            ],
-                            // Artikeldimensiecode 2 (verwijzing naar: Artikeldimensiecodes => AfasFbStockDimLines)
-                            'StL2' => [
-                                'alias' => 'dimension_2',
-                            ],
-                            // Direct leveren vanuit leverancier
-                            'DiDe' => [
-                                'alias' => 'direct_delivery',
-                                'type' => 'boolean',
-                            ],
-                        ],
-                    ];
-                    break;
-
-                case 'FbOrderBatchLines':
-                    $this->propertyDefinitions = [
-                        'fields' => [
-                            // Partijnummer
-                            'BaNu' => [
-                                'alias' => 'batch_number',
-                            ],
-                            // Eenheid (verwijzing naar: Eenheid => AfasFbUnit)
-                            'BiUn' => [
-                                'alias' => 'unit_type',
-                            ],
-                            // Aantal eenheden
-                            'QuUn' => [
-                                'alias' => 'quantity_units',
-                                'type' => 'decimal',
-                            ],
-                            // Aantal
-                            'Qu' => [
-                                'alias' => 'quantity',
-                                'type' => 'decimal',
-                            ],
-                            // Factuuraantal
-                            'QuIn' => [
-                                'alias' => 'quantity_invoice',
-                                'type' => 'decimal',
-                            ],
-                            // Opmerking
-                            'Re' => [
-                                'alias' => 'comment',
-                            ],
-                            // Lengte
-                            'QuLe' => [
-                                'alias' => 'length',
-                                'type' => 'decimal',
-                            ],
-                            // Breedte
-                            'QuWi' => [
-                                'alias' => 'width',
-                                'type' => 'decimal',
-                            ],
-                            // Hoogte
-                            'QuHe' => [
-                                'alias' => 'height',
-                                'type' => 'decimal',
-                            ],
-                        ],
-                    ];
-                    break;
-
-                case 'FbOrderSerialLines':
-                    $this->propertyDefinitions = [
-                        'fields' => [
-                            // Serienummer
-                            'SeNu' => [
-                                'alias' => 'serial_number',
-                            ],
-                            // Eenheid (verwijzing naar: Eenheid => AfasFbUnit)
-                            'BiUn' => [
-                                'alias' => 'unit_type',
-                            ],
-                            // Aantal eenheden
-                            'QuUn' => [
-                                'alias' => 'quantity_units',
-                                'type' => 'decimal',
-                            ],
-                            // Aantal
-                            'Qu' => [
-                                'alias' => 'quantity',
-                                'type' => 'decimal',
-                            ],
-                            // Factuuraantal
-                            'QuIn' => [
-                                'alias' => 'quantity_invoice',
-                                'type' => 'decimal',
-                            ],
-                            // Opmerking
-                            'Re' => [
-                                'alias' => 'comment',
-                            ],
-                        ],
-                    ];
-                    break;
-
-                default:
-                    throw new InvalidArgumentException("No property definitions found for '$type' object.");
-            }
-        }
         $this->type = $type;
         if (!is_string($parent_type)) {
             throw new InvalidArgumentException('$parent_type argument is not a string.');
         }
         $this->parentType = $parent_type;
         $this->setAction($action);
+
+        if (empty($this->propertyDefinitions)) {
+            $this->setPropertyDefinitions();
+        }
+        // Merge the overrides. (Also for definitions that were already set
+        // in child classes.)
+        $this->propertyDefinitions = $this->mergeDefinitionOverrides();
+
         $this->addElements($elements, $validation_behavior);
     }
 
@@ -1172,7 +853,7 @@ class UpdateObject
             }
         }
         if (!is_string($action) || ($action && !in_array($action, $actions, true))) {
-            throw new InvalidArgumentException('Unknown action value' . var_export($action, true) . '.');
+            throw new InvalidArgumentException('Unknown action value ' . var_export($action, true) . '.');
         }
 
         if (isset($element_index)) {
@@ -1224,8 +905,7 @@ class UpdateObject
      *   The ID value, or null if no value is set.
      *
      * @throws \OutOfBoundsException
-     *   If this object type has no 'id_property' definition, or no element
-     *   corresponding to the index exists.
+     *   If this object type has no 'id_property' definition.
      */
     public function getId($element_index = 0)
     {
@@ -1252,9 +932,6 @@ class UpdateObject
      *
      * @throws \InvalidArgumentException
      *   If the value has an unexpected type.
-     * @throws \OutOfBoundsException
-     *   If no element corresponding to the index exists and the index is
-     *   higher than the number of existing elements.
      * @throws \UnexpectedValueException
      *   If this object type has no 'id_property' definition.
      */
@@ -1298,7 +975,8 @@ class UpdateObject
      *
      * @throws \OutOfBoundsException
      *   If the field name/alias does not exist in this object type's "fields"
-     *   definition, or no element corresponding to the index exists.
+     *   definition, or no element corresponding to the index exists and
+     *   no default value is requested.
      */
     public function getField($field_name, $element_index = 0, $return_default = false, $wrap_array = false)
     {
@@ -1311,7 +989,8 @@ class UpdateObject
         // the default.
         if (array_key_exists($field_name, $element['Fields'])) {
             $return = $wrap_array ? [$element['Fields'][$field_name]] : $element['Fields'][$field_name];
-        } elseif ($return_default && array_key_exists('default', $this->propertyDefinitions['fields'][$field_name])) {
+        } elseif ($return_default && isset($this->propertyDefinitions['fields'][$field_name])
+            && array_key_exists('default', $this->propertyDefinitions['fields'][$field_name])) {
             $return = $wrap_array ? [$this->propertyDefinitions['fields'][$field_name]['default']] : $this->propertyDefinitions['fields'][$field_name]['default'];
         } else {
             $return = $wrap_array ? [] : null;
@@ -1351,8 +1030,7 @@ class UpdateObject
      *   If the value has an unexpected type.
      * @throws \OutOfBoundsException
      *   If the field name/alias does not exist in this object type's "fields"
-     *   definition, or if no element corresponding to the index exists and the
-     *   index is  higher than the number of existing elements.
+     *   definition.
      *
      * @see output()
      */
@@ -1361,8 +1039,6 @@ class UpdateObject
         $element = $this->checkElement($element_index, true);
         $field_name = $this->checkFieldName($field_name);
 
-        // validateFieldValue() gets definitions too but caching it here would
-        // add too much fussy code.
         $this->elements[$element_index]['Fields'][$field_name] = $this->validateFieldValue($value, $field_name, self::ALLOW_NO_CHANGES, $validation_behavior, $element_index, $element);
     }
 
@@ -1380,7 +1056,7 @@ class UpdateObject
      *
      * @throws \OutOfBoundsException
      *   If the field name/alias does not exist in this object type's "fields"
-     *   definition, or if no element corresponding to the index exists.
+     *   definition.
      */
     public function unsetField($field_name, $element_index = 0)
     {
@@ -1422,7 +1098,8 @@ class UpdateObject
      *
      * @throws \OutOfBoundsException
      *   If the reference field name/alias does not exist in this object type's
-     *   "objects" definition, or no element corresponding to the index exists.
+     *   "objects" definition, or no element corresponding to the index exists
+     *   and no default value is requested.
      * @throws \UnexpectedValueException
      *   If something's wrong with the default value.
      */
@@ -1490,8 +1167,7 @@ class UpdateObject
      *   If the element structure is invalid or the action value cannot be null.
      * @throws \OutOfBoundsException
      *   If the field name/alias does not exist in this object type's "fields"
-     *   definition, or if no element corresponding to the index exists and the
-     *   index is higher than the number of existing elements.
+     *   definition.
      *
      * @see create()
      * @see setAction()
@@ -1518,7 +1194,7 @@ class UpdateObject
      *
      * @throws \OutOfBoundsException
      *   If the field name/alias does not exist in this object type's "fields"
-     *   definition, or if no element corresponding to the index exists.
+     *   definition.
      */
     public function unsetObject($reference_field_name, $element_index = 0)
     {
@@ -1563,8 +1239,7 @@ class UpdateObject
      *   If the elements cannot be embedded or the action value cannot be null.
      * @throws \OutOfBoundsException
      *   If the field name/alias does not exist in this object type's "fields"
-     *   definition, or if no element corresponding to the index exists and the
-     *   index is higher than the number of existing elements.
+     *   definition.
      *
      * @return static
      *
@@ -1582,9 +1257,8 @@ class UpdateObject
         // this is a mandatory check, but on 'input' it can be suppressed.
         if ($validation_behavior & self::VALIDATE_ESSENTIAL && count($embedded_elements) > 1
             && empty($this->propertyDefinitions['objects'][$reference_field_name]['multiple'])) {
-            $element_descr = "'{$this->getType()}' element" . ($element_index ? " which has (or will get) index $element_index " : '');
             $name_and_alias = "'$reference_field_name'" . (isset($this->propertyDefinitions['objects'][$reference_field_name]['alias']) ? " ({$this->propertyDefinitions['objects'][$reference_field_name]['alias']})" : '');
-            throw new InvalidArgumentException("$name_and_alias object embedded in $element_descr contains " . count($embedded_elements) . ' elements but can only contain a single element.');
+            throw new InvalidArgumentException("Embedded object $name_and_alias contains " . count($embedded_elements) . ' elements but can only contain a single element.');
         }
 
         if (!isset($action)) {
@@ -1607,7 +1281,19 @@ class UpdateObject
         // but not always; there's a property to specify it.
         $type = !empty($this->propertyDefinitions['objects'][$reference_field_name]['type'])
             ? $this->propertyDefinitions['objects'][$reference_field_name]['type'] : $reference_field_name;
-        return static::create($type, $embedded_elements, $action, $validation_behavior, $this->getType());
+        try {
+            $object = static::create($type, $embedded_elements, $action, $validation_behavior, $this->getType());
+        } catch (InvalidArgumentException $e) {
+            // The message can contain multiple errors separated by newlines.
+            // Other messages in this method (just like validateFieldValue(),
+            // and validateObjectValue() which is on the same 'level' as this
+            // method but for output) mention the field name, so we should too.
+            // So we catch the error and add it to every line.
+            $error_prefix = "object-ref $reference_field_name: ";
+            throw new InvalidArgumentException($error_prefix . implode("\n$error_prefix", explode("\n", $e->getMessage())));
+        }
+
+        return $object;
     }
 
     /**
@@ -1701,7 +1387,7 @@ class UpdateObject
      *
      * This is about converting a single element to an array if necessary. It
      * does nothing to the structure of the element itself; that's
-     * normalizeElement().
+     * validateElementInput().
      *
      * @param array $elements
      *   The input data; see create() for details.
@@ -1715,14 +1401,16 @@ class UpdateObject
     protected function normalizeElements(array $elements)
     {
         // If the caller passed the element(s) inside an 'Element' wrapper
-        // array (because they are handling e.g. some external json-decoded
-        // string from another source, or embedded objects inside the
-        // getElements() return value), accept that. Strip the wrapper off.
-        if (count($elements) == 1 && key($elements) === 'Element') {
+        // array and/or that again wrapped inside a '<type> wrapper' (because
+        // they are handling e.g. some json-decoded string from another source,
+        // or embedded objects inside the getElements() return value), accept
+        // that. Strip the wrappers off - except if what would be left is not
+        // an array. (In that case we regard the key to be a field name.)
+        if (count($elements) == 1 && key($elements) === $this->getType() && is_array(reset($elements))) {
             $elements = reset($elements);
-            if (!is_array($elements)) {
-                throw new InvalidArgumentException("Element data inside 'Element' wrapper is not an array.");
-            }
+        }
+        if (count($elements) == 1 && key($elements) === 'Element' && is_array(reset($elements))) {
+            $elements = reset($elements);
         }
         // Determine if we have a single element or an array of elements.
         foreach ($elements as $key => $element) {
@@ -1737,9 +1425,8 @@ class UpdateObject
         return $elements;
     }
 
-
     /**
-     * Returns a uniformly structured representation of a single element.
+     * Validates, and uniformly structures, a single element.
      *
      * @param array $element
      *   The input data; see create() for details.
@@ -1750,14 +1437,17 @@ class UpdateObject
      *   create() for a more elaborate description.
      *
      * @return array
-     *   The element with uniform structure and field/object names.
+     *   The element with uniform structure and field/object names. Validation
+     *   errors are stored as a one-dimensional array under the '*errors' key.
      *
      * @throws \InvalidArgumentException
      *   If the data has an invalid structure.
+     * @throws \UnexpectedValueException
+     *   If this object's defined properties are invalid.
      *
      * @see create()
      */
-    protected function normalizeElement(array $element, $element_index, $validation_behavior = self::VALIDATE_ESSENTIAL)
+    protected function validateElementInput(array $element, $element_index, $validation_behavior = self::VALIDATE_ESSENTIAL)
     {
         if (empty($this->propertyDefinitions)) {
             throw new UnexpectedValueException("'{$this->getType()}' object has no property definitions.");
@@ -1769,7 +1459,6 @@ class UpdateObject
             throw new UnexpectedValueException("'{$this->getType()}' object has a non-array 'objects' property definition.");
         }
 
-        $element_descr = "'{$this->getType()}' element" . ($element_index ? " which will get index $element_index" : '');
         $normalized_element = [];
 
         // If this type has an ID field, check for it and set it in its
@@ -1781,18 +1470,29 @@ class UpdateObject
             }
             $id_property = '@' . $this->propertyDefinitions['id_property'];
             if (array_key_exists($id_property, $element)) {
-                if (array_key_exists('@id', $element) && $element['@id'] !== $element[$id_property]) {
-                    throw new InvalidArgumentException("{$this->getType()} object has the ID property provided by both its name '$id_property' and the generic alias '@id'.");
+                if (isset($element[$id_property]) && !is_int($element[$id_property]) && !is_string($element[$id_property])) {
+                    $normalized_element['*errors'][$id_property] = "'$id_property' property must hold integer/string value.";
                 }
                 $normalized_element[$id_property] = $element[$id_property];
                 // Unset so that we won't throw an exception at the end.
                 unset($element[$id_property]);
-            } elseif (array_key_exists('@id', $element)) {
-                $normalized_element[$id_property] = $element['@id'];
-                unset($element['@id']);
             }
-            if (isset($normalized_element[$id_property]) && !is_int($normalized_element[$id_property]) && !is_string($normalized_element[$id_property])) {
-                throw new InvalidArgumentException("'$id_property' property in $element_descr must hold integer/string value.");
+            if (array_key_exists('@id', $element)) {
+                // If 2 'id' properties exist, we validate both. The other one
+                // 'wins', which doesn't matter since we'll throw an exception
+                // in the end anyway.
+                if (isset($element['@id']) && !is_int($element['@id']) && !is_string($element['@id'])) {
+                    $normalized_element['*errors']['@id'] = "'@id' property must hold integer/string value.";
+                }
+                // We register an error only if the two id properties do not
+                // have the same value. This is different from the field/object
+                // values where we always throw an error if a duplicate exists.
+                if (array_key_exists($id_property, $element) && $element['@id'] !== $element[$id_property]) {
+                    $normalized_element['*errors']['@id:'] = "ID property is provided by both its name '$id_property' and the generic alias '@id'.";
+                } else {
+                    $normalized_element[$id_property] = $element['@id'];
+                }
+                unset($element['@id']);
             }
         }
 
@@ -1809,102 +1509,116 @@ class UpdateObject
         // field validation, embedded objects are already validated. So,
         // 'cheat' by pre-populating a 'Fields' key. (Note that if code
         // populates a new element using individual setObject(), setField() and
-        // setId() calls, it can influence the order of keys in output.)
+        // setId() calls, it can influence the order of keys in output.)element has a
         $normalized_element['Fields'] = [];
 
         // Validate / add objects, if object property definitions exist /
         // unless the 'well formed' element has no Objects.
+        if ($well_formed && isset($element['Objects']) && !is_array($element['Objects'])) {
+            $normalized_element['*errors']["Objects"] = "'Objects' value is not an array.";
+            unset($element['Objects']);
+        }
         if (!empty($this->propertyDefinitions['objects']) && (!$well_formed || isset($element['Objects']))) {
+            $well_formed_element_backup = $well_formed ? $element : [];
             if ($well_formed) {
-                $real_element = $element;
+                // This is the part we'll check and slowly unset.
                 $element = $element['Objects'];
-                if (!is_array($element)) {
-                    throw new InvalidArgumentException("$element_descr has a non-array 'Objects' value.");
-                }
             }
 
             foreach ($this->propertyDefinitions['objects'] as $name => $object_properties) {
                 if (!is_array($object_properties)) {
                     throw new UnexpectedValueException("'{$this->getType()}' object has a non-array definition for object '$name'.");
                 }
-                $value_present = false;
+                $alias = isset($object_properties['alias']) ? $object_properties['alias'] : '';
                 // Get value from the property equal to the object name (case
-                // sensitive!), or the alias. If two values are present with
-                // both name and alias, throw an exception.
-                $value_exists_by_alias = isset($object_properties['alias']) && array_key_exists($object_properties['alias'], $element);
+                // sensitive!), or the alias.
                 if (array_key_exists($name, $element)) {
-                    if ($value_exists_by_alias) {
-                        throw new InvalidArgumentException("$element_descr has a value provided by both its property name $name and alias $object_properties[alias].");
+                    // If values exist for both name and alias, we still
+                    // validate both, but throw an exception in the end.
+                    if (array_key_exists($alias, $element)) {
+                        $normalized_element['*errors']["Objects:$name:"] = "Object value is provided by both its property name $name and alias $object_properties[alias].";
                     }
-                    $value = $element[$name];
+
+                    if (!is_array($element[$name])) {
+                        $name_and_alias = "'$name'" . ($alias ? " ($alias)" : '');
+                        $normalized_element['*errors']["Objects:$name"] = "Value for $name_and_alias object is not an array.";
+                    } else {
+                        try {
+                            $normalized_element['Objects'][$name] = $this->createEmbeddedObject($name, $element[$name], NULL, $element_index, $validation_behavior);
+                        } catch (\Exception $e) {
+                            $normalized_element['*errors']["Objects:$name"] = $e->getMessage();
+                        }
+                    }
                     unset($element[$name]);
-                    $value_present = true;
-                } elseif ($value_exists_by_alias) {
-                    $value = $element[$object_properties['alias']];
-                    unset($element[$object_properties['alias']]);
-                    $value_present = true;
                 }
-
-                if ($value_present) {
-                    /** @noinspection PhpUndefinedVariableInspection */
-                    if (!is_array($value)) {
-                        $property = $name . (isset($alias) ? " ($alias)" : '');
-                        throw new InvalidArgumentException("Value for '$property' object embedded in $element_descr must be array.");
+                if ($alias && array_key_exists($alias, $element)) {
+                    if (!is_array($element[$alias])) {
+                        $name_and_alias = "'$name'" . ($alias ? " ($alias)" : '');
+                        $normalized_element['*errors']["Objects:$alias"] = "Value for $name_and_alias object is not an array.";
+                    } else {
+                        try {
+                            $normalized_element['Objects'][$name] = $this->createEmbeddedObject($name, $element[$alias], NULL, $element_index, $validation_behavior);
+                        } catch (\Exception $e) {
+                            $normalized_element['*errors']["Objects:$alias"] = $e->getMessage();
+                        }
                     }
-
-                    $normalized_element['Objects'][$name] = $this->createEmbeddedObject($name, $value, null, $element_index, $validation_behavior);
+                    unset($element[$alias]);
                 }
             }
 
             // If the element is 'well formed', then we can check for unknown
             // object definitions here.
-            if ($well_formed) {
+            if ($well_formed_element_backup) {
                 if ($element) {
                     $keys = "'" . implode(', ', array_keys($element)) . "'";
-                    throw new OutOfBoundsException("Unknown 'Objects' properties provided for $element_descr: names are $keys.");
+                    $normalized_element['*errors']['Objects:'] = "Unknown 'Objects' properties provided: names are $keys.";
                 }
-                /** @noinspection PhpUndefinedVariableInspection */
-                $element = $real_element;
+                $element = $well_formed_element_backup;
+                // Unset for last check.
                 unset($element['Objects']);
             }
         }
 
         // Validate / add fields, if field property definitions exist / unless
         // the element has no Fields.
+        if ($well_formed && isset($element['Fields']) && !is_array($element['Fields'])) {
+            $normalized_element['*errors']["Fields"] = "'Fields' value is not an array.";
+            unset($element['Fields']);
+        }
         if (!empty($this->propertyDefinitions['fields']) && ($well_formed ? isset($element['Fields']) : $element)) {
             if ($well_formed) {
                 // Nothing except 'Fields' is left.
                 $element = $element['Fields'];
-                if (!is_array($element)) {
-                    throw new InvalidArgumentException("$element_descr has a non-array 'Fields' value.");
-                }
             }
 
             foreach ($this->propertyDefinitions['fields'] as $name => $field_properties) {
                 if (!is_array($field_properties)) {
                     throw new UnexpectedValueException("'{$this->getType()}' object has a non-array definition for field '$name'.");
                 }
-                $value_present = false;
+                $alias = isset($field_properties['alias']) ? $field_properties['alias'] : '';
                 // Get value from the property equal to the field name (case
-                // sensitive!), or the alias. If two values are present with
-                // both field name and alias, throw an exception.
-                $value_exists_by_alias = isset($field_properties['alias']) && array_key_exists($field_properties['alias'], $element);
+                // sensitive!), or the alias.
                 if (array_key_exists($name, $element)) {
-                    if ($value_exists_by_alias) {
-                        throw new InvalidArgumentException("$element_descr has a value provided by both its field name $name and alias $field_properties[alias].");
+                    // If values exist for both name and alias, we still
+                    // validate both, but throw an exception in the end.
+                    if (array_key_exists($alias, $element)) {
+                        $normalized_element['*errors']["Fields:$name:"] = "Field value is provided by both its field name $name and alias $field_properties[alias].";
                     }
-                    $value = $element[$name];
-                    unset($element[$name]);
-                    $value_present = true;
-                } elseif ($value_exists_by_alias) {
-                    $value = $element[$field_properties['alias']];
-                    unset($element[$field_properties['alias']]);
-                    $value_present = true;
-                }
 
-                if ($value_present) {
-                    /** @noinspection PhpUndefinedVariableInspection */
-                    $normalized_element['Fields'][$name] = $this->validateFieldValue($value, $name, self::ALLOW_NO_CHANGES, $validation_behavior, $element_index, $normalized_element);
+                    try {
+                        $normalized_element['Fields'][$name] = $this->validateFieldValue($element[$name], $name, self::ALLOW_NO_CHANGES, $validation_behavior, $element_index, $normalized_element);
+                    } catch (\Exception $e) {
+                        $normalized_element['*errors']["Fields:$name"] = $e->getMessage();
+                    }
+                    unset($element[$name]);
+                }
+                if ($alias && array_key_exists($alias, $element)) {
+                    try {
+                        $normalized_element['Fields'][$name] = $this->validateFieldValue($element[$alias], $name, self::ALLOW_NO_CHANGES, $validation_behavior, $element_index, $normalized_element);
+                    } catch (\Exception $e) {
+                        $normalized_element['*errors']["Fields:$alias"] = $e->getMessage();
+                    }
+                    unset($element[$alias]);
                 }
             }
         }
@@ -1914,7 +1628,7 @@ class UpdateObject
         if ($element) {
             $keys = "'" . implode(', ', array_keys($element)) . "'";
             $description = $well_formed ? "'Fields'" : 'element';
-            throw new OutOfBoundsException("Unknown $description properties provided for $element_descr: names are $keys.");
+            $normalized_element['*errors'][':'] = "Unknown $description properties provided: names are $keys.";
         }
 
         // If we didn't populate any fields, then unset our 'cheat' value.
@@ -1950,9 +1664,8 @@ class UpdateObject
      *   create() for a more elaborate description.
      *
      * @throws \InvalidArgumentException
-     *   If the element data contains invalid values.
-     * @throws \OutOfBoundsException
-     *   If the element data contains unknown field/object names.
+     *   If the element data contains invalid values or unknown field/object
+     *   names.
      * @throws \UnexpectedValueException
      *   If this object's defined properties are invalid.
      *
@@ -1960,7 +1673,11 @@ class UpdateObject
      */
     public function setElement($element_index, array $element, $validation_behavior = self::VALIDATE_ESSENTIAL)
     {
-        $this->elements[$element_index] = $this->normalizeElement($element, $element_index, $validation_behavior);
+        $element = $this->validateElementInput($element, $element_index, $validation_behavior);
+        if (!empty($element['*errors'])) {
+            throw new InvalidArgumentException(implode("\n", $element['*errors']));
+        }
+        $this->elements[$element_index] = $element;
     }
 
     /**
@@ -2013,9 +1730,9 @@ class UpdateObject
      *   create() for a more elaborate description.
      *
      * @throws \InvalidArgumentException
-     *   If the element data contains invalid values.
-     * @throws \OutOfBoundsException
-     *   If the element data contains unknown field/object names.
+     *   If the element data contains invalid values or unknown field/object
+     *   names. If one of the passed elements has an error, none of them will
+     *   be added.
      * @throws \UnexpectedValueException
      *   If this object's defined properties are invalid.
      *
@@ -2024,20 +1741,57 @@ class UpdateObject
     public function addElements(array $elements, $validation_behavior = self::VALIDATE_ESSENTIAL)
     {
         $elements = $this->normalizeElements($elements);
+        $validated_elements = [];
+        $errors = [];
 
         // Log messages will contain the index which the element will get; not
         // the index which the element currently has in $elements. If this
         // object already contains elements and we are trying to add multiple
         // elements in this call, that could be confusing. Otherwise, not very.
         $next_index = count($this->elements);
-        foreach ($elements as $element) {
+        foreach ($elements as $index => $element) {
             // We allow callers to add their own index values so we cannot
             // assume that the one we want to add does not exist.
             while (isset($this->elements[$next_index])) {
                 $next_index++;
             }
-            $this->elements[$next_index] = $this->normalizeElement($element, $next_index, $validation_behavior);
+            $element = $this->validateElementInput($element, $next_index, $validation_behavior);
+
+            if (isset($element['*errors'])) {
+                if (!is_array($element['*errors'])) {
+                    throw new UnexpectedValueException('Something unexpected during validation. We got a single value where we expected an array:' . print_r($element['*errors'], TRUE));
+                }
+                if ($element['*errors']) {
+                    // There may be multiple keyed errors; each may contain
+                    // multiple errors separated by newlines (if they come from
+                    // an embedded object.) Prefix all of them with the element
+                    // key if we're adding multiple elements. Do not mention
+                    // the object type itself in errors: the caller supposedly
+                    // knows the object it's calling, and for errors in
+                    // embedded objects the object name is almost-duplicate
+                    // with the reference field name which is already included.
+                    $error_prefix = (count($elements) > 1 ? "element-key $index: " : '');
+                    foreach ($element['*errors'] as $key => $value) {
+                        $errors["$index:$key"] = $error_prefix ?
+                            ($error_prefix . implode("\n$error_prefix", explode("\n", $value))) : $value;
+                    }
+                } else {
+                    unset($element['*errors']);
+                }
+            }
+
+            // We can't set the elements until after all of them are validated.
+            $validated_elements[$next_index] = $element;
+            $next_index++;
         }
+
+        if ($errors) {
+            // We expect the error messages are descriptive enough and will
+            // disregard the error keys. (Though who knows some code might find
+            // them useful, or we will get back to this, later.)
+            throw new InvalidArgumentException(implode("\n", $errors));
+        }
+        $this->elements = array_merge($this->elements, $validated_elements);
     }
 
     /**
@@ -2079,43 +1833,60 @@ class UpdateObject
             throw new InvalidArgumentException('$validation_behavior argument is not an integer.');
         }
 
+        $original_properties = $this->propertyDefinitions;
         $return = [];
         $errors = [];
-        foreach ($this->elements as $element_index => $element) {
-            // Standard code can never have non-numeric indices and non-array
-            // elements, but check everything, in case a child class messes up.
-            if (!is_array($element)) {
-                // We never expose the index value but let's keep it as-is in
-                // error messages - except suppress it when we have 1 element.
-                $element_descr = "'{$this->getType()}' element" . ($element_index ? " with index $element_index" : '');
-                throw new UnexpectedValueException("$element_descr is not an array.");
-            }
-            $element = $this->validateElement($element, $element_index, $change_behavior, $validation_behavior);
-
-            if (isset($element['*errors'])) {
-                if (!is_array($element['*errors'])) {
-                    throw new UnexpectedValueException('Something unexpected during validation. We got a single value where we expected an array:' . print_r($element['*errors'], TRUE));
+        try {
+            foreach ($this->elements as $element_index => $element) {
+                // Standard code can never have non-array elements. Still,
+                // check it, in case a child class messes up.
+                if (!is_array($element)) {
+                    // We only expose the index value in errors if we seem to
+                    // have multiple elements (because non-zero index.)
+                    $element_descr = 'element' . ($element_index ? " with index $element_index" : '');
+                    throw new UnexpectedValueException("$element_descr is not an array.");
                 }
-                if ($element['*errors']) {
-                    if ($errors) {
-                        // Merge errors from two elements.
+                $element = $this->validateElement($element, $element_index, $change_behavior, $validation_behavior);
+
+                if (isset($element['*errors'])) {
+                    if (!is_array($element['*errors'])) {
+                        throw new UnexpectedValueException('Something unexpected during validation. We got a single value where we expected an array:' . print_r($element['*errors'], TRUE));
+                    }
+                    if ($element['*errors']) {
+                        // There may be multiple keyed errors; each may have
+                        // multiple errors separated by newlines (if they come
+                        // from an embedded object.) Prefix all of them with
+                        // the element key if we're validating multiple
+                        // elements. Do not mention the object type itself in
+                        // errors: the caller supposedly knows the object it's
+                        // calling, and for errors in embedded objects the
+                        // object name is almost-duplicate with the reference
+                        // field name which is already included.
+                        $error_prefix = (count($this->elements) > 1 ? "element-key $element_index: " : '');
                         foreach ($element['*errors'] as $key => $value) {
-                            $errors["$element_index:$key"] = $value;
+                            $errors["$element_index:$key"] = $error_prefix ?
+                                ($error_prefix . implode("\n$error_prefix", explode("\n", $value))) : $value;
                         }
                     } else {
-                        // We don't care enough about the keys to renumber them
-                        // if this is not the first element.
-                        $errors = $element['*errors'];
+                        unset($element['*errors']);
                     }
-                } else {
-                    unset($element['*errors']);
+                }
+                if ($element) {
+                    $return[] = $element;
                 }
             }
-            if ($element) {
-                $return[] = $element;
-            }
+        } finally {
+            // As documented, validation methods are allowed to modify the
+            // property definitions. This should have no effect on behavior
+            // after this method is called, so we could leave it changed, but
+            // unit tests sometimes benefit from being able to test whether
+            // the object as a whole is unchanged after validation.
+            $this->propertyDefinitions = $original_properties;
         }
         if ($errors) {
+            // We (mostly?) don't need the error keys because they've been
+            // transferred into the error messages already by above implode() &
+            // validateObjectValue().
             throw new UnexpectedValueException(implode("\n", $errors));
         }
 
@@ -2125,9 +1896,11 @@ class UpdateObject
     /**
      * Validates one element against a list of property definitions.
      *
-     * This method has some boilerplate / checks integrated into it which are
-     * also necessary for some protected methods it calls and don't need to be
-     * repeated there. It should not touch $this->elements.
+     * This method is the starting point for 'validation on output' of an
+     * element; there's a tree structure of protected methods to do all the
+     * validation. It contains some checks that are actually necessary for some
+     * of those methods and don't need to be repeated there. It should not
+     * touch $this->elements.
      *
      * @param array $element
      *   The element (usually the single one contained in $this->elements) that
@@ -2152,7 +1925,9 @@ class UpdateObject
     protected function validateElement(array $element, $element_index, $change_behavior = self::DEFAULT_CHANGE, $validation_behavior = self::DEFAULT_VALIDATION)
     {
         // Do most low level structure checks here so that the other validate*()
-        // methods are easier to override.
+        // methods are easier to override. Only include the type in the
+        // exceptions we throw immediately; the '*error's we return will be
+        // handled by the parent (so we can properly handle embedded objects).
         $element_descr = "'{$this->getType()}' element" . ($element_index ? " with index $element_index" : '');
         if (isset($element['Fields']) && !is_array($element['Fields'])) {
             throw new UnexpectedValueException("$element_descr has a non-array 'Fields' property value.");
@@ -2190,7 +1965,7 @@ class UpdateObject
             if ($validation_behavior & self::VALIDATE_ESSENTIAL) {
                 if (isset($element[$id_property])) {
                     if (!is_int($element[$id_property]) && !is_string($element[$id_property])) {
-                        $element['*errors'][$id_property] = "'$id_property' property in $element_descr must hold integer/string value.";
+                        $element['*errors'][$id_property] = "'$id_property' property must hold integer/string value.";
                     }
                 } else {
                     // If action is "insert", we are guessing that there
@@ -2201,7 +1976,7 @@ class UpdateObject
                     // value if action is different than "insert".
                     $action = $this->getAction($element_index);
                     if ($action !== 'insert') {
-                        $element['*errors'][$id_property] = "'$id_property' property in $element_descr must have a value, or Action '$action' must be set to 'insert'.";
+                        $element['*errors'][$id_property] = "'$id_property' property must have a value, or Action '$action' must be set to 'insert'.";
                     }
                 }
             }
@@ -2217,21 +1992,21 @@ class UpdateObject
         if ($validation_behavior & self::VALIDATE_NO_UNKNOWN) {
             // Validate that all Fields/Objects/other properties are known.
             // This is a somewhat superfluous check because we already do this
-            // in addElements() (where we more or less have to, because our
-            // input is not divided over 'Objects' and 'Fields' so
-            // addElements() has to decide how/where to set each property).
+            // in validateElementInput() (where we more or less have to because
+            // our input is not necessarily divided over 'Objects' and 'Fields'
+            // so validateElementInput() has to decide what each property is).
             if (!empty($element['Fields']) && $unknown = array_diff_key($element['Fields'], $this->propertyDefinitions['fields'])) {
-                $element['*errors']['Fields'] = "Unknown field(s) encountered in $element_descr: " . implode(', ', array_keys($unknown));
+                $element['*errors']['Fields'] = "Unknown field(s) encountered: " . implode(', ', array_keys($unknown));
             }
             if (!empty($element['Objects']) && !empty($this->propertyDefinitions['objects']) && $unknown = array_diff_key($element['Objects'], $this->propertyDefinitions['objects'])) {
-                $element['*errors']['Objects'] = "Unknown object(s) encountered in $element_descr: " . implode(', ', array_keys($unknown));
+                $element['*errors']['Objects'] = "Unknown object(s) encountered: " . implode(', ', array_keys($unknown));
             }
             $known_properties = ['Fields' => true, 'Objects' => true, '*errors' => true];
             if (!empty($this->propertyDefinitions['id_property'])) {
                 $known_properties['@' . $this->propertyDefinitions['id_property']] = true;
             }
             if ($unknown = array_diff_key($element, $known_properties)) {
-                $element['*errors']['*'] = "Unknown properties encountered in $element_descr: " . implode(', ', array_keys($unknown));
+                $element['*errors']['*'] = "Unknown properties encountered: " . implode(', ', array_keys($unknown));
             }
         }
 
@@ -2274,7 +2049,6 @@ class UpdateObject
         $action = $this->getAction($element_index);
         $defaults_allowed = ($action === 'insert' && $change_behavior & self::ALLOW_DEFAULTS_ON_INSERT)
             || ($action === 'update' && $change_behavior & self::ALLOW_DEFAULTS_ON_UPDATE);
-        $element_descr = "'{$this->getType()}' element" . ($element_index ? " with index $element_index" : '');
 
         // Check requiredness for reference field, and create a default object
         // if it's missing (where defined. Defaults are unlikely to ever be
@@ -2288,12 +2062,8 @@ class UpdateObject
             // a null default value means 'no default available' (instead of
             // 'a default of null', which it does in validateFields().)
             $default_available = $defaults_allowed && isset($object_properties['default']);
-            // Requiredness is only checked for action "insert"; the
-            // VALIDATE_ESSENTIAL bit does not change that. (So far, we've only
-            // seen 'required on update' situations only for fields which are
-            // not proper fields, and those situations are solved in custom
-            // code in child classes.)
             $validate_required_value = !empty($object_properties['required'])
+                && $action === 'insert'
                 && ($validation_behavior & self::VALIDATE_REQUIRED
                     || ($object_properties['required'] === 1 && $validation_behavior & self::VALIDATE_ESSENTIAL));
             // Throw an exception if we have no-or-null ref-field value and no
@@ -2304,7 +2074,7 @@ class UpdateObject
                 && (!$default_available || array_key_exists($ref_name, $element['Objects']))
             ) {
                 $name_and_alias = "'$ref_name'" . (isset($object_properties['alias']) ? " ({$object_properties['alias']})" : '');
-                $element['*errors']["Objects:$ref_name"] = "No value provided for required $name_and_alias object embedded in $element_descr.";
+                $element['*errors']["Objects:$ref_name"] = "No value provided for required embedded object $name_and_alias.";
             } else {
                 // Set default if value is missing, or if value is null and
                 // field is required (and if we are allowed to set it, but
@@ -2318,13 +2088,15 @@ class UpdateObject
                 if (isset($element['Objects'][$ref_name])) {
                     // Replace UpdateObject with validated array representation.
                     try {
-                        $object_value = $this->validateObjectValue($element['Objects'][$ref_name], $ref_name, $change_behavior, $validation_behavior, $element_index);
+                        $object_value = $this->validateObjectValue($element['Objects'][$ref_name], $ref_name, $change_behavior, $validation_behavior);
                         if ($object_value) {
                             $element['Objects'][$ref_name] = ['Element' => $object_value];
                         } else {
                             unset($element['Objects'][$ref_name]);
                         }
-                    } catch (UnexpectedValueException $e) {
+                    } catch (InvalidArgumentException $e) {
+                        // This message may contain several errors separated by
+                        // newlines.
                         $element['*errors']["Objects:$ref_name"] = $e->getMessage();
                     }
                 }
@@ -2379,7 +2151,6 @@ class UpdateObject
         $action = $this->getAction($element_index);
         $defaults_allowed = ($action === 'insert' && $change_behavior & self::ALLOW_DEFAULTS_ON_INSERT)
             || ($action === 'update' && $change_behavior & self::ALLOW_DEFAULTS_ON_UPDATE);
-        $element_descr = "'{$this->getType()}' element" . ($element_index ? " with index $element_index" : '');
 
         // Check required fields and add default values for fields (where
         // defined). About definitions:
@@ -2415,7 +2186,7 @@ class UpdateObject
                     || (array_key_exists($name, $element['Fields']) && $field_properties['default'] !== null))
             ) {
                 $name_and_alias = "'$name'" . (isset($field_properties['alias']) ? " ({$field_properties['alias']})" : '');
-                $element['*errors']["Fields:$name"] = "No value provided for required $name_and_alias field of $element_descr.";
+                $element['*errors']["Fields:$name"] = "No value provided for required $name_and_alias field.";
             } else {
                 // Set default if value is missing, or if value is null and
                 // field is required (and if we are allowed to set it, but
@@ -2423,7 +2194,17 @@ class UpdateObject
                 if ($default_available
                     && (!array_key_exists($name, $element['Fields'])
                         || !empty($field_properties['required']) && $element['Fields'][$name] === null)) {
-                    $element['Fields'][$name] = $field_properties['default'];
+                    // Support dynamic default value of "today" for date
+                    // fields; convert it to yyyy-mm-dd today. (We might also
+                    // be able to dynamically convert the value "today" set by
+                    // the user, but let's not do that unless it has a proven
+                    // value.)
+                    if ($field_properties['default'] === 'today'
+                        && isset($field_properties['type']) && $field_properties['type'] === 'date') {
+                        $element['Fields'][$name] = date('Y-m-d');
+                    } else {
+                        $element['Fields'][$name] = $field_properties['default'];
+                    }
                 }
 
                 if (isset($element['Fields'][$name])) {
@@ -2451,30 +2232,38 @@ class UpdateObject
      *   element and may still need to be amended to apply to embedded objects.
      * @param int $validation_behavior
      *   (Optional) see output().
-     * @param int|string $element_index
-     *   (Optional) The index of the element in our object data. Often only
-     *   used for logging.
      *
      * @return array
      *   A representation of the object's contents: either a single element, or
      *   an array of one or more elements, depending on the 'multiple' property
      *   definition for the corresponding reference field.
      *
-     * @throws \UnexpectedValueException
+     * @throws \InvalidArgumentException
      *   If the element data does not pass validation.
      */
-    protected function validateObjectValue($value, $reference_field_name, $change_behavior = self::DEFAULT_CHANGE, $validation_behavior = self::DEFAULT_VALIDATION, $element_index = null)
+    protected function validateObjectValue($value, $reference_field_name, $change_behavior = self::DEFAULT_CHANGE, $validation_behavior = self::DEFAULT_VALIDATION)
     {
         if (!$value instanceof UpdateObject) {
-            $element_descr = "'{$this->getType()}' element" . ($element_index ? " with index $element_index" : '');
             $name_and_alias = "'$reference_field_name'" . (isset($this->propertyDefinitions['objects'][$reference_field_name]['alias']) ? " ({$this->propertyDefinitions['objects'][$reference_field_name]['alias']})" : '');
-            throw new UnexpectedValueException("$name_and_alias object embedded in $element_descr must be an object of type UpdateObject.");
+            throw new InvalidArgumentException("Embedded object $name_and_alias must be an object of type UpdateObject.");
         }
 
         // Validation of a full object is done by getElements().
         $embedded_change_behavior = $change_behavior & self::ALLOW_EMBEDDED_CHANGES
             ? $change_behavior : self::ALLOW_NO_CHANGES;
-        $elements = $value->getElements($embedded_change_behavior, $validation_behavior);
+        try {
+            $elements = $value->getElements($embedded_change_behavior, $validation_behavior);
+        } catch (UnexpectedValueException $e) {
+            // getElements() throws an UnexpectedValueException rather than
+            // passing '*errors' back, because it's public. The message can
+            // contain multiple errors separated by newlines. Other messages in
+            // this method (just like validateFieldValue()) mention the field
+            // name, so we should too. So we catch the error and add it to
+            // every line.
+            $error_prefix = "object-ref $reference_field_name: ";
+            throw new InvalidArgumentException($error_prefix . implode("\n$error_prefix", explode("\n", $e->getMessage())));
+        }
+
         // Validate whether this reference field is allowed to have multiple
         // elements. Also, decide the exact structure of "Elements" in the
         // embedded objects. I'm making assumptions here because I don't have
@@ -2505,9 +2294,8 @@ class UpdateObject
             if (count($elements) == 1) {
                 $elements = reset($elements);
             } elseif ($elements && $validation_behavior & self::VALIDATE_ESSENTIAL) {
-                $element_descr = "'{$this->getType()}' element" . ($element_index ? " with index $element_index" : '');
                 $name_and_alias = "'$reference_field_name'" . (isset($this->propertyDefinitions['objects'][$reference_field_name]['alias']) ? " ({$this->propertyDefinitions['objects'][$reference_field_name]['alias']})" : '');
-                throw new UnexpectedValueException("$name_and_alias object embedded in $element_descr contains " . count($elements) . ' elements but can only contain a single element.');
+                throw new InvalidArgumentException("Embedded object $name_and_alias contains " . count($elements) . ' elements but can only contain a single element.');
             }
         }
 
@@ -2549,8 +2337,8 @@ class UpdateObject
      *   this method should be aware of its limitations which we'll illustrate
      *   by the standard callers in this class:
      *   - When called while an element is being populated, we cannot assume
-     *     all other fields have been populated yet. (addElements() does this
-     *     in the order in which fields occur in $this->propertyDefinitions.)
+     *     all other fields have been populated yet. (validateElementInput()
+     *     does this in the order in which fields occur in propertyDefinitions.)
      *     We also cannot assume any fields have been validated. (That depends
      *     on 'validation behavior' when those fields were populated.)
      *   - When called by setField(), we cannot assume other fields have been
@@ -2574,7 +2362,7 @@ class UpdateObject
             if ($validation_behavior & self::VALIDATE_ESSENTIAL) {
                 try {
                     if (!is_scalar($value)) {
-                        throw new InvalidArgumentException("%NAME field value of %ELEMENT must be scalar.");
+                        throw new InvalidArgumentException("%NAME field value must be scalar.");
                     }
 
                     if (!empty($this->propertyDefinitions['fields'][$field_name]['type'])) {
@@ -2582,21 +2370,45 @@ class UpdateObject
                             case 'integer':
                             case 'decimal':
                                 if (!is_numeric($value)) {
-                                    throw new InvalidArgumentException("%NAME field value of %ELEMENT must be numeric.");
+                                    throw new InvalidArgumentException("%NAME field value is not numeric.");
                                 }
                                 if ($this->propertyDefinitions['fields'][$field_name]['type'] === 'integer' && strpos((string)$value, '.') !== false) {
-                                    throw new InvalidArgumentException("%NAME field value of %ELEMENT must be an integer value.");
+                                    throw new InvalidArgumentException("%NAME field value is not a valid integer value.");
                                 }
                                 // @todo check digits for decimal, if/when we know that's necessary.
+                                break;
+
+                            case 'boolean':
+                                // In this general class we'll be a bit lenient
+                                // about what we accept as boolean, but we
+                                // won't accept and silently convert just any
+                                // string/number. Let's accept 0 / 1 / -1 too.
+                                if (!is_bool($value)) {
+                                    $valid = false;
+                                    if (is_string($value) && in_array(strtolower($value), ['true', 'false'], true)) {
+                                        $valid = true;
+                                    }
+                                    if (is_numeric($value) && in_array($value, [0, 1, -1])) {
+                                        $valid = true;
+                                    }
+                                    if (!$valid) {
+                                        throw new InvalidArgumentException("%NAME field value is not a valid boolean value.");
+                                    }
+                                }
+                                break;
+
+                            case 'email':
+                                if (!filter_var($value, FILTER_VALIDATE_EMAIL)) {
+                                  throw new InvalidArgumentException("%NAME field value is not a valid e-mail address.");
+                                }
                                 break;
                         }
                     }
                 } catch (InvalidArgumentException $e) {
                     // Catch and rethrow because we don't feel like repeatedly
                     // defining the element & field name constructions above.
-                    $element_descr = "'{$this->getType()}' element" . ($element_index ? " which has (or will get) index $element_index" : '');
                     $name_and_alias = "'$field_name'" . (isset($this->propertyDefinitions['fields'][$field_name]['alias']) ? " ({$this->propertyDefinitions['fields'][$field_name]['alias']})" : '');
-                    throw new InvalidArgumentException(str_replace('%NAME', $name_and_alias, str_replace('%ELEMENT', $element_descr, $e->getMessage())));
+                    throw new InvalidArgumentException(str_replace('%NAME', $name_and_alias, $e->getMessage()));
                 }
             }
 
@@ -2604,7 +2416,7 @@ class UpdateObject
             // - This isn't done on 'input' (from setField() / addElements());
             //   values are only guaranteed to be converted cast to their
             //   correct type during 'output' validation (e.g. output() /
-            //   getElements() if this flag is set.
+            //   getElements() if the ALLOW_REFORMAT flag is set.
             // - If VALIDATE_ESSENTIAL was not set on 'input' and not on
             //   'output' either, that can mean data loss when invalid values
             //   are converted. We won't guard against that; changing fields
@@ -2746,7 +2558,7 @@ class UpdateObject
         if (empty($elements)) {
             // Strictly speaking, this is "no non-empty elements" because empty
             // ones are allowed in our internal structure, but filtered.
-            throw new UnexpectedValueException("'{$this->getType()}' object holds no elements.");
+            throw new UnexpectedValueException("Object holds no elements.");
         }
 
         switch (strtolower($format)) {
@@ -2905,4 +2717,723 @@ class UpdateObject
         return $xml;
     }
 
+    /**
+     * Produces property definitions with the overrides merged into them.
+     *
+     * Class properties 'propertyDefinitions' and 'type' must already be set.
+     *
+     * @return array
+     *   The overridden definitions.
+     *
+     * @throws \UnexpectedValueException
+     *   If any error is encountered.
+     */
+    protected function mergeDefinitionOverrides()
+    {
+        $definitions = $this->propertyDefinitions;
+        $type = $this->getType();
+        if (!$type) {
+            throw new UnexpectedValueException('Object type is not set.');
+        }
+
+        if (!isset(self::$definitionOverrides[$type])) {
+            $definition_overrides = [];
+        } elseif (!is_array(self::$definitionOverrides[$type])) {
+            throw new UnexpectedValueException("Definition overrides for '$type' is not an array.");
+        } else {
+            $definition_overrides = self::$definitionOverrides[$type];
+        }
+
+        // Validate the overrides for 'fields' and 'objects'; change or unset
+        // definitions where necessary.
+        try {
+            static::validateDefinitionOverrides($definition_overrides);
+        } catch (InvalidArgumentException $e) {
+            throw new UnexpectedValueException($e->getMessage());
+        }
+
+        foreach (['fields', 'objects'] as $subtype) {
+            if (isset($definition_overrides[$subtype])) {
+                // Each field definition must be an array or null. Merge or
+                // unset depending on the value.
+                foreach ($definition_overrides[$subtype] as $name => $value) {
+                    if (isset($value)) {
+                        $definitions[$subtype][$name] = $value;
+                    } else {
+                        unset($definitions[$subtype][$name]);
+                    }
+                }
+            }
+        }
+
+        // Change or unset the outer properties except 'fields' and 'objects'.
+        // Value does not need to be an array.
+        foreach ($definition_overrides as $name => $value) {
+            if ($name !== 'fields' && $name !== 'objects') {
+                if (isset($value)) {
+                    $definitions[$name] = $value;
+                } else {
+                    unset($definitions[$name]);
+                }
+            }
+        }
+
+        // Handle individual field overrides.
+        if (isset(self::$fieldOverrides[$type])) {
+            if (!is_array(self::$fieldOverrides[$type])) {
+                throw new UnexpectedValueException("Field overrides for '$type' is not an array.");
+            }
+            foreach (self::$fieldOverrides[$type] as $field => $override) {
+                if (!is_array($override)) {
+                    throw new UnexpectedValueException("Field overrides for '$type/$field' is not an array.");
+                }
+                foreach ($override as $property => $value) {
+                    $definitions['fields'][$field][$property] = $value;
+                }
+            }
+        }
+
+        return $definitions;
+    }
+
+    /**
+     * Sets property definitions.
+     *
+     * This method is called from the constructor only. It exists to enable
+     * a child class to override existing property definitions (which must be
+     * done during construction) inside the child class' code. It is not called
+     * by every class; only by classes where overriding properties would not be
+     * possible easily by overriding the constructor directly, so now it can be
+     * done by overriding this method instead.
+     *
+     * There is however another, recommended, method for overriding property
+     * definitions: calling the static method overridePropertyDefinitions().
+     * Using that method, there's no need for subclassing just to e.g. add a
+     * custom field to an existing object.
+     */
+    protected function setPropertyDefinitions() {
+        // Below definitions are based on what AFAS calls the 'XSD Schema' for
+        // SOAP, retrieved though a Data Connector in november 2014. They're
+        // amended with extra info like more understandable aliases for the
+        // field names, and default values. There are lots of Dutch comment
+        // lines in this function; these were gathered from an online knowledge
+        // base page around 2012 when that was the only form / language of
+        // documentation.
+        switch ($this->type) {
+            case 'FbSubscription':
+                $this->propertyDefinitions = [
+                    'objects' => [
+                        'FbSubscriptionLines' => [
+                            'alias' => 'line_items',
+                            'multiple' => true,
+                        ],
+                    ],
+                    'fields' => [
+                        'BcId' => [
+                            'alias' => 'organisation_id',
+                            'required' => true,
+                        ],
+                        'CtPe' => [
+                            'alias' => 'contact_id',
+                            'required' => true,
+                        ],
+                        'DbId' => [
+                            'alias' => 'debtor_id',
+                            'required' => true,
+                        ],
+                        'SuSt' => [
+                            'alias' => 'order_date',
+                            'type' => 'date',
+                            'required' => true,
+                        ],
+                        'VaIn' => [],
+                        'VaRe' => [],
+                        'DaRe' => [],
+                    ],
+                ];
+                break;
+
+            case 'FbSubscriptionLines':
+                $this->propertyDefinitions = [
+                    'fields' => [
+                        'Id' => [
+                            'alias' => 'guid',
+                        ],
+                        'ItCd' => [
+                            'alias' => 'item_code',
+                        ],
+                        'VaIt' => [
+                            'alias' => 'item_type',
+                        ],
+                        'Qu' => [
+                            'alias' => 'quantity',
+                            'type' => 'integer',
+                        ],
+                        'DaSt' => [
+                            'alias' => 'start_date',
+                            'type' => 'date',
+                            'required' => true,
+                        ],
+                        'DaPu' => [
+                            'alias' => 'start_date',
+                            'type' => 'date',
+                            'required' => true,
+                            // The default "today" for a date gets converted to yyyy-mm-dd.
+                            'default' => 'today',
+                        ],
+                    ],
+                ];
+                break;
+
+            case 'KnCourseMember':
+                // I'm  not sure what the exact usage is. It might be that
+                // SuDa needs a default of today, but only if it's the date of
+                // registration and not the date of the course. And in that
+                // case, I'd expect there to be a KnCourseEvent type which has
+                // the course date... but we don't have that defined yet.
+                $this->propertyDefinitions = [
+                    'fields' => [
+                        'BcCo' => [
+                            'alias' => 'organisation_code',
+                            'required' => true,
+                        ],
+                        'DeId' => [
+                            'alias' => 'debtor_id',
+                        ],
+                        'CrId' => [
+                            'alias' => 'event_id',
+                        ],
+                        'CdId' => [
+                            'alias' => 'contact_id',
+                        ],
+                        'SuDa' => [
+                            'alias' => 'subscription_date',
+                            'type' => 'date',
+                            'required' => true,
+                        ],
+                        'DfPr' => [
+                            'alias' => 'price',
+                            'type' => 'decimal',
+                        ],
+                        'DiPc' => [
+                            'alias' => 'discount_perc',
+                        ],
+                        'Invo' => [
+                            'required' => true,
+                        ],
+                        'Rm' => [
+                            'alias' => 'comment',
+                        ],
+                    ],
+                ];
+                break;
+
+            case 'KnProvApplication':
+                $this->propertyDefinitions = [
+                    'fields' => [
+                        'BcCo' => [
+                            'alias' => 'organisation_code',
+                            'required' => true,
+                        ],
+                        'PvCd' => [
+                            'required' => true,
+                        ],
+                        'PvCt' => [
+                            'required' => true,
+                        ],
+                        'VaPt' => [
+                            'required' => true,
+                        ],
+                    ],
+                ];
+                break;
+
+            // This seems to be where the object model breaks down a bit.
+            // KnSalesRelationOrg and KnSalesRelationPer clearly seem to share
+            // the same 'object space'. (I suspect that only one of these can
+            // have the same ID.) The same is the case for KnBasicAddressAdr
+            // and KnBasicAddressPad, so I concluded that there must be one
+            // object type, and named it 'KnBasicAddress'. That works because
+            // addresses cannot be sent to AFAS as separate objects. Sales
+            // relations can, and at least in the SOAP API must have e.g.
+            // 'KnSalesRelationPer' in the header. Which is a bit surprising.
+            // So until further info comes in, we define them as two types.
+            case 'KnSalesRelationOrg':
+            case 'KnSalesRelationPer':
+                $this->propertyDefinitions = [
+                    'id_property' => 'DbId',
+                    'fields' => [
+                        // 'is debtor'?
+                        'IsDb' => [
+                            'type' => 'boolean',
+                            'default' => true,
+                        ],
+                        // According to AFAS docs, PaCd / VaDu "are required
+                        // if IsDb==True" ... no further specs.
+                        // [ comment 2014: ]
+                        // Heh, VaDu is not even in our inserted XML so that
+                        // does not seem to be actually true.
+                        'PaCd' => [
+                            'default' => '14',
+                        ],
+                        'CuId' => [
+                            'alias' => 'currency_code',
+                            'default' => 'EUR',
+                        ],
+                        'Bl' => [
+                            'default' => 'false',
+                        ],
+                        'AuPa' => [
+                            'default' => '0',
+                        ],
+                        // Verzamelrekening Debiteur
+                        // [ comment 2014: ] Apparently these just need to be
+                        // specified by whoever is setting up the AFAS
+                        // administration?
+                        'ColA' => [
+                            'alias' => 'coll_account',
+                        ],
+                        // [ comment 2014: ]
+                        // ?? Doesn't seem to be required, but we're still
+                        // setting default to the old value we're used to,
+                        // until we know what this field means.
+                        'VtIn' => [
+                            'default' => '1',
+                        ],
+                        'PfId' => [
+                            'default' => '*****',
+                        ],
+                    ],
+                ];
+                if ($this->getType() === 'KnSalesRelationOrg') {
+                    $this->propertyDefinitions['fields']['VaId'] = [
+                        'alias' => 'vat_number',
+                    ];
+                    $this->propertyDefinitions['objects'] = [
+                        'KnOrganisation' => [
+                            'alias' => 'organisation',
+                        ],
+                    ];
+                } else {
+                    $this->propertyDefinitions['objects'] = [
+                        'KnPerson' => [
+                            'alias' => 'person',
+                        ],
+                    ];
+                }
+                break;
+
+            case 'KnSubject':
+                $this->propertyDefinitions = [
+                    'id_property' => 'SbId',
+                    // See definition of KnS01: I'm not sure if this is correct.
+                    'objects' => [
+                        'KnSubjectLink' => [
+                            'alias' => 'subject_link',
+                        ],
+                        'KnS01' => [
+                            'alias' => 'subject_link_1',
+                        ],
+                        'KnS02' => [
+                            'alias' => 'subject_link_2',
+                        ],
+                        // If there are more KnSNN, they have all custom fields?
+                    ],
+                    'fields' => [
+                        // Type dossieritem (verwijzing naar: Type dossieritem => AfasKnSubjectType)
+                        'StId' => [
+                            'alias' => 'type',
+                            'type' => 'integer',
+                            'required' => true,
+                        ],
+                        // Onderwerp
+                        'Ds' => [
+                            'alias' => 'description',
+                        ],
+                        // Toelichting
+                        'SbTx' => [
+                            'alias' => 'comment',
+                        ],
+                        // Instuurdatum
+                        'Da' => [
+                            'alias' => 'date',
+                            'type' => 'date',
+                        ],
+                        // Verantwoordelijke (verwijzing naar: Medewerker => AfasKnEmployee)
+                        'EmId' => [
+                            'alias' => 'responsible',
+                        ],
+                        // Aanleiding (verwijzing naar: Dossieritem => AfasKnSubject)
+                        'SbHi' => [
+                            'type' => 'integer',
+                        ],
+                        // Type actie (verwijzing naar: Type actie => AfasKnSubjectActionType)
+                        'SaId' => [
+                            'alias' => 'action_type',
+                        ],
+                        // Prioriteit (verwijzing naar: Tabelwaarde,Prioriteit actie => AfasKnCodeTableValue)
+                        'ViPr' => [],
+                        // Bron (verwijzing naar: Brongegevens => AfasKnSourceData)
+                        'ScId' => [
+                            'alias' => 'source',
+                        ],
+                        // Begindatum
+                        'DtFr' => [
+                            'alias' => 'start_date',
+                            'type' => 'date',
+                        ],
+                        // Einddatum
+                        'DtTo' => [
+                            'alias' => 'end_date',
+                            'type' => 'date',
+                        ],
+                        // Afgehandeld
+                        'St' => [
+                            'alias' => 'done',
+                            'type' => 'boolean',
+                        ],
+                        // Datum afgehandeld
+                        'DtSt' => [
+                            'alias' => 'done_date',
+                            'type' => 'date',
+                        ],
+                        // Waarde kenmerk 1 (verwijzing naar: Waarde kenmerk => AfasKnFeatureValue)
+                        'FvF1' => [
+                            'type' => 'integer',
+                        ],
+                        // Waarde kenmerk 2 (verwijzing naar: Waarde kenmerk => AfasKnFeatureValue)
+                        'FvF2' => [
+                            'type' => 'integer',
+                        ],
+                        // Waarde kenmerk 3 (verwijzing naar: Waarde kenmerk => AfasKnFeatureValue)
+                        'FvF3' => [
+                            'type' => 'integer',
+                        ],
+                        // Geblokkeerd
+                        'SbBl' => [
+                            'alias' => 'blocked',
+                            'type' => 'boolean',
+                        ],
+                        // Bijlage
+                        'SbPa' => [
+                            'alias' => 'attachment',
+                        ],
+                        // Save file with subject
+                        'FileTrans' => [
+                            'type' => 'boolean',
+                        ],
+                        // File as byte-array
+                        'FileStream' => [],
+                    ],
+                ];
+                break;
+
+            case 'KnSubjectLink':
+                $this->propertyDefinitions = [
+                    'id_property' => 'SbId',
+                    'fields' => [
+                        // Save in CRM Subject
+                        'DoCRM' => [
+                            'type' => 'boolean',
+                        ],
+                        // Organisatie/persoon
+                        'ToBC' => [
+                            'alias' => 'is_org_person',
+                            'type' => 'boolean',
+                        ],
+                        // Medewerker
+                        'ToEm' => [
+                            'alias' => 'is_employee',
+                            'type' => 'boolean',
+                        ],
+                        // Verkooprelatie
+                        'ToSR' => [
+                            'alias' => 'is_sales_relation',
+                            'type' => 'boolean',
+                        ],
+                        // Inkooprelatie
+                        'ToPR' => [
+                            'alias' => 'is_purchase_relation',
+                            'type' => 'boolean',
+                        ],
+                        // Cliënt IB
+                        'ToCl' => [
+                            'alias' => 'is_client_ib',
+                            'type' => 'boolean',
+                        ],
+                        // Cliënt Vpb
+                        'ToCV' => [
+                            'alias' => 'is_client_vpb',
+                            'type' => 'boolean',
+                        ],
+                        // Werkgever
+                        'ToEr' => [
+                            'alias' => 'is_employer',
+                            'type' => 'boolean',
+                        ],
+                        // Sollicitant
+                        'ToAp' => [
+                            'alias' => 'is_applicant',
+                            'type' => 'boolean',
+                        ],
+                        // Type bestemming
+                        // Values:  1:Geen   2:Medewerker   3:Organisatie/persoon   4:Verkooprelatie   8:Cliënt IB   9:Cliënt Vpb   10:Werkgever   11:Inkooprelatie   17:Sollicitant   30:Campagne   31:Item   32:Cursusevenement-->
+                        'SfTp' => [
+                            'alias' => 'destination_type',
+                            'type' => 'integer',
+                        ],
+                        // Bestemming
+                        'SfId' => [
+                            'alias' => 'destination_id',
+                        ],
+                        // Organisatie/persoon (verwijzing naar: Organisatie/persoon => AfasKnBasicContact)
+                        'BcId' => [
+                            'alias' => 'org_person',
+                        ],
+                        // Contact (verwijzing naar: Contact => AfasKnContactData)
+                        'CdId' => [
+                            'alias' => 'contact',
+                            'type' => 'integer',
+                        ],
+                        // Administratie (Verkoop) (verwijzing naar: Administratie => AfasKnUnit)
+                        'SiUn' => [
+                            'type' => 'integer',
+                        ],
+                        // Factuurtype (verkoop) (verwijzing naar: Type factuur => AfasFiInvoiceType)
+                        'SiTp' => [
+                            'alias' => 'sales_invoice_type',
+                            'type' => 'integer',
+                        ],
+                        // Verkoopfactuur (verwijzing naar: Factuur => AfasFiInvoice)
+                        'SiId' => [
+                            'alias' => 'sales_invoice',
+                        ],
+                        // Administratie (Inkoop) (verwijzing naar: Administratie => AfasKnUnit)
+                        'PiUn' => [
+                            'type' => 'integer',
+                        ],
+                        // Factuurtype (inkoop) (verwijzing naar: Type factuur => AfasFiInvoiceType)
+                        'PiTp' => [
+                            'alias' => 'purchase_invoice_type',
+                            'type' => 'integer',
+                        ],
+                        // Inkoopfactuur (verwijzing naar: Factuur => AfasFiInvoice)
+                        'PiId' => [
+                            'alias' => 'purchase_invoice',
+                        ],
+                        // Fiscaal jaar (verwijzing naar: Aangiftejaren => AfasTxDeclarationYear)
+                        'FiYe' => [
+                            'alias' => 'fiscal_year',
+                            'type' => 'integer',
+                        ],
+                        // Project (verwijzing naar: Project => AfasPtProject)
+                        'PjId' => [
+                            'alias' => 'project',
+                        ],
+                        // Campagne (verwijzing naar: Campagne => AfasCmCampaign)
+                        'CaId' => [
+                            'alias' => 'campaign',
+                            'type' => 'integer',
+                        ],
+                        // Actief (verwijzing naar: Vaste activa => AfasFaFixedAssets)
+                        'FaSn' => [
+                            'type' => 'integer',
+                        ],
+                        // Voorcalculatie (verwijzing naar: Voorcalculatie => AfasKnQuotation)
+                        'QuId' => [],
+                        // Dossieritem (verwijzing naar: Dossieritem => AfasKnSubject)
+                        'SjId' => [
+                            'type' => 'integer',
+                        ],
+                        // Abonnement (verwijzing naar: Abonnement => AfasFbSubscription
+                        'SuNr' => [
+                            'alias' => 'subscription',
+                            'type' => 'integer',
+                        ],
+                        // Dienstverband
+                        'DvSn' => [
+                            'type' => 'integer',
+                        ],
+                        // Type item (verwijzing naar: Tabelwaarde,Itemtype => AfasKnCodeTableValue)
+                        // Values:  Wst:Werksoort   Pid:Productie-indicator   Deg:Deeg   Dim:Artikeldimensietotaal   Art:Artikel   Txt:Tekst   Sub:Subtotaal   Tsl:Toeslag   Kst:Kosten   Sam:Samenstelling   Crs:Cursus-->
+                        // NOTE: are these really 3-letter codes? See
+                        // description for FbSales.VaIt which has integers.
+                        'VaIt' => [
+                            'alias' => 'item_type',
+                        ],
+                        // Itemcode (verwijzing naar: Item => AfasFbBasicItems)
+                        'BiId' => [
+                            'alias' => 'item_code',
+                        ],
+                        // Cursusevenement (verwijzing naar: Evenement => AfasKnCourseEvent)
+                        'CrId' => [
+                            'alias' => 'course_event',
+                            'type' => 'integer',
+                        ],
+                        // Verzuimmelding (verwijzing naar: Verzuimmelding => AfasHrAbsIllnessMut)
+                        'AbId' => [
+                            'type' => 'integer',
+                        ],
+                        // Forecast (verwijzing naar: Forecast => AfasCmForecast)
+                        'FoSn' => [
+                            'type' => 'integer',
+                        ],
+                    ],
+                ];
+                break;
+
+            // I do not know if the following is correct: back in 2014, the XSD
+            // schema / Data Connector contained separate explicit definitions
+            // for KnS01 and KnS02, which suggested they are separate object
+            // types with defined fields, even though their fields all start
+            // with 'U'. I can imagine that the XSD contained just examples and
+            // actually it is up to the AFAS environment to define these. If
+            // so, the following definitions should be removed from here and
+            // KnS01 should be implemented (and the related 'object reference
+            // fields' in KnSubject should be overridden) in custom classes.
+            case 'KnS01':
+                $this->propertyDefinitions = [
+                    'id_property' => 'SbId',
+                    'fields' => [
+                        // Vervaldatum
+                        'U001' => [
+                            'alias' => 'end_date',
+                            'type' => 'date',
+                        ],
+                        // Identiteitsnummer
+                        'U002' => [
+                            'alias' => 'id_number',
+                        ],
+                    ],
+                ];
+                break;
+
+            case 'KnS02':
+                $this->propertyDefinitions = [
+                    'id_property' => 'SbId',
+                    'fields' => [
+                        // Contractnummer
+                        'U001' => [
+                            'alias' => 'contract_number',
+                        ],
+                        // Begindatum contract
+                        'U002' => [
+                            'alias' => 'start_date',
+                            'type' => 'date',
+                        ],
+                        // Einddatum contract
+                        'U003' => [
+                            'alias' => 'start_date',
+                            'type' => 'date',
+                        ],
+                        // Waarde
+                        'U004' => [
+                            'alias' => 'value',
+                            'type' => 'decimal',
+                        ],
+                        // Beëindigd
+                        'U005' => [
+                            'alias' => 'ended',
+                            'type' => 'boolean',
+                        ],
+                        // Stilzwijgend verlengen
+                        'U006' => [
+                            'alias' => 'recurring',
+                            'type' => 'boolean',
+                        ],
+                        // Opzegtermijn (verwijzing naar: Tabelwaarde,(Afwijkende) opzegtermijn => AfasKnCodeTableValue)
+                        'U007' => [
+                            'alias' => 'cancel_term',
+                        ],
+                    ],
+                ];
+                break;
+
+            case 'FbOrderBatchLines':
+                $this->propertyDefinitions = [
+                    'fields' => [
+                        // Partijnummer
+                        'BaNu' => [
+                            'alias' => 'batch_number',
+                        ],
+                        // Eenheid (verwijzing naar: Eenheid => AfasFbUnit)
+                        'BiUn' => [
+                            'alias' => 'unit_type',
+                        ],
+                        // Aantal eenheden
+                        'QuUn' => [
+                            'alias' => 'quantity_units',
+                            'type' => 'decimal',
+                        ],
+                        // Aantal
+                        'Qu' => [
+                            'alias' => 'quantity',
+                            'type' => 'decimal',
+                        ],
+                        // Factuuraantal
+                        'QuIn' => [
+                            'alias' => 'quantity_invoice',
+                            'type' => 'decimal',
+                        ],
+                        // Opmerking
+                        'Re' => [
+                            'alias' => 'comment',
+                        ],
+                        // Lengte
+                        'QuLe' => [
+                            'alias' => 'length',
+                            'type' => 'decimal',
+                        ],
+                        // Breedte
+                        'QuWi' => [
+                            'alias' => 'width',
+                            'type' => 'decimal',
+                        ],
+                        // Hoogte
+                        'QuHe' => [
+                            'alias' => 'height',
+                            'type' => 'decimal',
+                        ],
+                    ],
+                ];
+                break;
+
+            case 'FbOrderSerialLines':
+                $this->propertyDefinitions = [
+                    'fields' => [
+                        // Serienummer
+                        'SeNu' => [
+                            'alias' => 'serial_number',
+                        ],
+                        // Eenheid (verwijzing naar: Eenheid => AfasFbUnit)
+                        'BiUn' => [
+                            'alias' => 'unit_type',
+                        ],
+                        // Aantal eenheden
+                        'QuUn' => [
+                            'alias' => 'quantity_units',
+                            'type' => 'decimal',
+                        ],
+                        // Aantal
+                        'Qu' => [
+                            'alias' => 'quantity',
+                            'type' => 'decimal',
+                        ],
+                        // Factuuraantal
+                        'QuIn' => [
+                            'alias' => 'quantity_invoice',
+                            'type' => 'decimal',
+                        ],
+                        // Opmerking
+                        'Re' => [
+                            'alias' => 'comment',
+                        ],
+                    ],
+                ];
+                break;
+
+            default:
+                throw new InvalidArgumentException("No property definitions found for '{$this->type}' object.");
+        }
+    }
 }

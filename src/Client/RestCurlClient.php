@@ -14,17 +14,24 @@ use InvalidArgumentException;
 use RuntimeException;
 
 /**
- * Wrapper around client specific details of making a remote AFAS call.
+ * Client for getting/sending data from/to AFAS, using REST API through CURL.
  *
- * This class contains one public method: callAfas(), and uses CURL to connect
- * to the REST API.
+ * This class takes care of authentication / connection details but has no
+ * logic around interpreting any results. On any error, an exception is thrown.
+ *
+ * It has no official interface. It contains two public methods:
+ * - getClientType(): a static method which may be needed when not using this
+ *   class standalone.
+ * - callAfas(): the only method needed in order to make calls to AFAS. The
+ *   arguments and return value may differ depending on the client type.
  */
 class RestCurlClient
 {
-    /**
-     * CLIENT_TYPE is necessary for the Connection class to work with it.
-     */
-    const CLIENT_TYPE = 'REST';
+
+    public static function getClientType()
+    {
+        return 'REST';
+    }
 
     /**
      * Configuration options.
@@ -32,6 +39,13 @@ class RestCurlClient
      * @var array
      */
     protected $options;
+
+    /**
+     * Options to set for Curl.
+     *
+     * @var array
+     */
+    protected $curlOptions;
 
     /**
      * HTTP headers which are disallowed, or seen in constructor options.
@@ -64,22 +78,34 @@ class RestCurlClient
      *   - customerId:      Customer ID, as used in the AFAS endpoint URL.
      *   - appToken:        Token used for the App connector.
      *   Optional:
+     *   - environment:     Which AFAS environment to connect to. Can be 'test'
+     *                      or 'accept'; if not specified, the client connects
+     *                      to the live environment.
      *   - headers:         HTTP headers to pass to Curl: an array of key-value
      *                      pairs in the form of ['User-Agent' => 'Me', ...].
-     *   - curlOptions:     Options to pass to Curl: an array of values keyed by
-     *                      CURLOPT_ constants. Some options are overridden /
-     *                      not possible to set through here.
+     * @param array $curl_options
+     *   Options to pass to Curl (besides the HTTP headers), keyed by CURLOPT_
+     *   constants. Some are overridden / not possible to set through here.
      *
      * @throws \InvalidArgumentException
      *   If some option values are missing / incorrect.
+     * @throws \RuntimeException
+     *   If the AFAS connection is known to fail.
      */
-    public function __construct(array $options)
+    public function __construct(array $options, $curl_options = [])
     {
         foreach (['customerId', 'appToken'] as $required_key) {
             if (empty($options[$required_key])) {
                 $classname = get_class($this);
                 throw new InvalidArgumentException("Required configuration parameter for $classname missing: $required_key.", 1);
             }
+        }
+
+        // For v1.0 compatibility:
+        if (empty($curl_options) && isset($options['curlOptions']) && is_array($options['curlOptions'])) {
+            $this->curlOptions = $options['curlOptions'];
+        } else {
+            $this->curlOptions = $curl_options;
         }
 
         $options += ['headers' => []];
@@ -94,7 +120,18 @@ class RestCurlClient
             'Authorization' => 'AfasToken ' . base64_encode('<token><version>1</version><data>' . $options['appToken'] . '</data></token>')
         ], $options['headers'], 'strcasecmp');
         // Sanitize/set HTTPHEADER Curl option.
-        $options['curlOptions'][CURLOPT_HTTPHEADER] = $this->httpHeaders($options['headers'] + $default_headers);
+        $this->curlOptions[CURLOPT_HTTPHEADER] = $this->httpHeaders($options['headers'] + $default_headers);
+
+        // From ~november 2018, AFAS has a new endpoint that forces TLS 1.2 as
+        // a minimum. We know how to force a specific TLS version but
+        // apparently cannot specify '1.2 or higher'. If people want TLS 1.3 or
+        // higher, they will have to pass CURLOPT_SSLVERSION in curlOptions.
+        if (!isset($this->curlOptions[CURLOPT_SSLVERSION])) {
+            if (!defined('CURL_SSLVERSION_TLSv1_2')) {
+                throw new RuntimeException("PHP's Curl extension does not support TLS v1.2, which AFAS requires.");
+            }
+            $this->curlOptions[CURLOPT_SSLVERSION] = CURL_SSLVERSION_TLSv1_2;
+        }
 
         // We will not use 'headers' and 'appToken' in our own code (because
         // they are contained in 'curlOptions'), but won't clean them out.
@@ -156,16 +193,13 @@ class RestCurlClient
      *
      * This class is not meant to make decisions about any actual data sent.
      * (That kind of code would belong in Connection.) So while we can
-     * _validate_ many arguments here, _setting_ them is discouraged. (SOAP
-     * clients need this to set authentication/connection related arguments here
-     * rather than query related arguments... but for REST, such an application
-     * is not know yet. Still, we kept the possibility.)
+     * validate many arguments here, setting/changing them is discouraged.
      *
      * @param array $arguments
      *   Named URL arguments. All argument names must be lower case; all values
      *   must be scalars.
-     * @param string $function
-     *   The REST API 'function' (URL) to call.
+     * @param string $endpoint
+     *   The REST API endpoint URL.
      * @param string $type
      *   HTTP verb: GET, PUT, POST, DELETE. Must be upper case.
      * @param string $request_body
@@ -177,7 +211,7 @@ class RestCurlClient
      * @throws \InvalidArgumentException
      *   For invalid function arguments.
      */
-    protected function validateArguments($arguments, $function, $type, $request_body)
+    protected function validateArguments($arguments, $endpoint, $type, $request_body)
     {
         if (!in_array($type, ['GET', 'PUT', 'POST', 'DELETE'], true)) {
             throw new InvalidArgumentException("Invalid HTTP verb '$type''", 40);
@@ -194,14 +228,19 @@ class RestCurlClient
             if ($request_body) {
                 throw new InvalidArgumentException('Request body must not be provided for GET requests.', 40);
             }
-
-            if (isset($arguments['take']) && (!is_numeric($arguments['take']) || $arguments['take'] <= 0)) {
-                // A value of 0 would return 1 record (at least at the time we
-                // last tested). We disallow that to prevent possible confusion.
-                throw new InvalidArgumentException("'take' argument must be a positive number.", 42);
-            }
-            if (isset($arguments['skip']) && (!is_numeric($arguments['skip']) || $arguments['skip'] < 0)) {
-                throw new InvalidArgumentException("'skip' argument must be a positive number or 0.", 43);
+            // If 'skip' is -1, 'take' isn't validated at all and the full data
+            // set is returned (which can obviously lead to timeouts). A
+            // 'skip' that is smaller than -1 or non-numeric is apparently
+            // equivalent to 0.
+            if (empty($arguments['skip']) || $arguments['skip'] != -1) {
+                // A value of 0 would return 1 row (tested May 2017). We
+                // disallow that to prevent possible confusion. We also
+                // validate other disallowed values rather than have AFAS
+                // return an error, because we can do a better job at the error
+                // message.
+                if (isset($arguments['take']) && (!is_numeric($arguments['take']) || $arguments['take'] <= 0)) {
+                    throw new InvalidArgumentException("'take' argument must be a positive number.", 42);
+                }
             }
         }
 
@@ -213,11 +252,10 @@ class RestCurlClient
      *
      * @param string $type
      *   HTTP verb: GET, PUT, POST, DELETE.
-     * @param string $function
-     *   The REST API 'function' (URL) to call. The caller is expected to ensure
-     *   its validity.
+     * @param string $endpoint
+     *   The REST API endpoint URL.
      * @param array $arguments
-     *   Named URL arguments. All values must be scalars. Unlike $function, all
+     *   Named URL arguments. All values must be scalars. Unlike $endpoint, all
      *   names/values will be escaped. (Case of the argument names gets changed;
      *   if there are multiple arguments whose names only differ in case, then
      *   the value that is later in the array will override earlier arguments.)
@@ -231,12 +269,11 @@ class RestCurlClient
      *
      * @throws \InvalidArgumentException
      *   For invalid function arguments or unknown connector type.
-     * @throws \UnexpectedValueException
-     *   If the SoapClient returned a response in an unknown format.
-     * @throws \Exception
-     *   For anything else that went wrong, e.g. initializing the SoapClient.
+     * @throws \RuntimeException
+     *   If an error was returned by the endpoint, or was encountered while
+     *   connecting to the endpoint.
      */
-    public function callAfas($type, $function, array $arguments, $request_body = '')
+    public function callAfas($type, $endpoint, array $arguments, $request_body = '')
     {
         $type = strtoupper($type);
         // Unify case of arguments, so we don't skip any validation. (If two
@@ -244,11 +281,12 @@ class RestCurlClient
         // later in the array will override other indices.)
         $arguments = array_change_key_case($arguments);
 
-        $arguments = $this->validateArguments($arguments, $function, $type, $request_body);
+        $arguments = $this->validateArguments($arguments, $endpoint, $type, $request_body);
 
-        // Unlike other input, we don't escape $function (we assume it is safe)
+        $env = !empty($this->options['environment']) ? $this->options['environment'] : '';
+        // Unlike other input, we don't escape $endpoint (we assume it is safe)
         // because otherwise we can't have slashes in there.
-        $endpoint = 'https://' . rawurlencode($this->options['customerId']) . ".afasonlineconnector.nl/ProfitRestServices/$function";
+        $endpoint = 'https://' . rawurlencode($this->options['customerId']) . ".rest$env.afas.online/profitrestservices/$endpoint";
         if ($arguments) {
             $params = [];
             foreach ($arguments as $key => $value) {
@@ -278,7 +316,7 @@ class RestCurlClient
             // All our content so far is JSON, so it seems good to specify a
             // Content-Type including character set.
             if (!isset($this->headersSeenOrDisallowed['content-type'])) {
-                $this->options['curlOptions'][CURLOPT_HTTPHEADER][] = 'Content-Type: application/json; charset="utf-8"';
+                $this->curlOptions[CURLOPT_HTTPHEADER][] = 'Content-Type: application/json; charset="utf-8"';
             }
             // We will not set Content-Length because it seems to potentially
             // complicate matters (w.r.t. multi-byte strings) and does not
@@ -286,9 +324,12 @@ class RestCurlClient
         }
 
         $ch = curl_init();
-        curl_setopt_array($ch, $forced_options + $this->options['curlOptions']);
+        curl_setopt_array($ch, $forced_options + $this->curlOptions);
         $response = curl_exec($ch);
-        list($response_headers, $response) = explode("\r\n\r\n", $response);
+        $response_headers = '';
+        if ($response !== false) {
+            list($response_headers, $response) = explode("\r\n\r\n", $response);
+        }
         $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
         $curl_errno = curl_errno($ch);
         $curl_error = curl_error($ch);
@@ -297,7 +338,7 @@ class RestCurlClient
             // Body is likely empty but we'll still log it. Since our Connection
             // uses low error codes, add 800 to the thrown code, in case the
             // caller cares about distinguishing them.
-            throw new RuntimeException("CURL returned code: $curl_errno / error: \"$curl_error\" / response body: \"$response\"", $curl_error + 800);
+            throw new RuntimeException("CURL returned code: $curl_errno / error: \"$curl_error\" / response body: \"$response\"", $curl_errno + 800);
         }
         // We'll start out strict, and cancel on all unexpected return codes.
         if ($http_code != 200 && ($http_code != 201 || !in_array($type, ['POST', 'PUT'], true))) {

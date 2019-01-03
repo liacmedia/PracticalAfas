@@ -11,6 +11,7 @@
 namespace PracticalAfas;
 
 use InvalidArgumentException;
+use PracticalAfas\UpdateConnector\UpdateObject;
 use RuntimeException;
 use SimpleXMLElement;
 use UnexpectedValueException;
@@ -96,28 +97,11 @@ class Connection
     const GET_METADATA_YES = 1;
 
     /**
-     * The name of the helper class we use for many sendData calls.
-     *
-     * There is no getter/setter for this. It's only injected in the
-     * constructor.
-     *
-     * @var string
-     */
-    protected $helperClassName;
-
-    /**
      * The PracticalAfas client we use to execute actual AFAS calls.
      *
-     * @var object
+     * @var \PracticalAfas\Client\RestCurlClient|object
      */
     protected $client;
-
-    /**
-     * The 'type of client': "REST" or "SOAP".
-     *
-     * @var string
-     */
-    protected $clientType;
 
     /**
      * Default output format by getData() calls. See setDataOutputFormat().
@@ -145,24 +129,19 @@ class Connection
      *
      * @param object $client
      *   A PracticalAfas client object.
-     * @param string $helper_class_name
-     *   (optional) name of a class containing helper methods. This is used in
-     *   sendData(), for now; see there for the method names. We inject a class
-     *   name, not an instantiated object, since the methods are static and not
-     *   always used. The typical use case for passing this argument is to set
-     *   a subclass of Helper, which has had objectTypeInfo() extended with
-     *   custom field definitions.
+     *
+     * @throws \RuntimeException
+     *   If the object is not recognized as a PracticalAfas client.
      */
-    public function __construct($client, $helper_class_name = '\PracticalAfas\Helper')
+    public function __construct($client)
     {
         $this->setClient($client);
-        $this->helperClassName = $helper_class_name;
     }
 
     /**
-     * Returns the AFAS client object.
+     * Returns the PracticalAfas client object.
      *
-     * @return object
+     * @return \PracticalAfas\Client\RestCurlClient|object
      */
     public function getClient()
     {
@@ -177,29 +156,70 @@ class Connection
      * to a value that makes getData() calls throw an exception, so these
      * properties might need to be explicitly (re)set too.
      *
+     * The object type for a client is not strictly defined. (It does not have
+     * an interface.) This is on purpose; as long as the 'interface' is as
+     * simple as it is (i.e. two methods callAfas() and getClientType()) and
+     * testing is not impaired, we can enable anyone to use those client
+     * classes standalone in their PHP experiments, without even using an
+     * autoloader.
+     *
      * @param object $client
      *   An AFAS client object.
+     *
+     * @throws \InvalidArgumentException
+     *   If the object is not recognized as a PracticalAfas client.
+     * @throws \RuntimeException
+     *   If the system is not capable of executing AFAS calls with this client.
      */
     public function setClient($client)
     {
+        if (!is_callable([$client, 'callAfas']) || !is_callable([$client, 'getClientType'])) {
+            throw new InvalidArgumentException('Object is not a PracticalAfas client class.', 2);
+        }
         $this->client = $client;
-        $class = get_class($client);
-        // Set the type so the rest of our code can decide on logic to follow.
-        // Historically, SOAP classes have not had a type defined.
-        $this->clientType = defined("$class::CLIENT_TYPE") ? $class::CLIENT_TYPE : 'SOAP';
-        if (!in_array($this->clientType, ['REST', 'SOAP'], true)) {
-            throw new InvalidArgumentException("Unrecognized client type {$this->clientType}.", 1);
+
+        $type = $this->getClientType();
+        if (!in_array($type, ['REST', 'SOAP'], true)) {
+            throw new InvalidArgumentException("Unrecognized client type $type.", 1);
+        }
+
+        $required_extensions = $type === 'SOAP'
+            ? ['openssl', 'simplexml', 'soap'] : ['curl', 'json', 'openssl'];
+        $missing_extensions = [];
+        foreach ($required_extensions as $extension) {
+            if (!extension_loaded($extension)) {
+                $missing_extensions[] = $extension;
+            }
+        }
+        if ($missing_extensions) {
+            throw new RuntimeException('The following PHP extension(s) must be installed to work with the AFAS client: ' . implode(',', $missing_extensions) . '.');
         }
     }
 
     /**
      * Returns the 'type' of client set for this connection: "REST" or "SOAP".
      *
+     * This is not exactly necessary to exist in the Connection class, but
+     * getting it from the client type is not a one liner / may be confusing
+     * for some people, since it's a static method.
+     *
      * @return string
      */
     public function getClientType()
     {
-        return $this->clientType;
+        $client =  $this->client;
+        // We shouldn't need the strtoupper() but just for security's sake...
+        return strtoupper($client::getClientType());
+    }
+
+    /**
+     * Indicates the data format accepted / returned by this client's endpoint.
+     *
+     * @return string
+     */
+    public function getDataFormat()
+    {
+        return $this->getClientType() === 'SOAP' ? 'xml' : 'json';
     }
 
     /**
@@ -262,7 +282,7 @@ class Connection
         if (isset($this->includeMetadata)) {
             $ret = $this->includeMetadata;
         } else {
-            $ret = $this->clientType !== 'SOAP' && $this->getDataOutputFormat() == self::GET_OUTPUTMODE_LITERAL;
+            $ret = $this->getClientType() !== 'SOAP' && $this->getDataOutputFormat() == self::GET_OUTPUTMODE_LITERAL;
         }
         return $ret;
     }
@@ -292,7 +312,7 @@ class Connection
      */
     public function getDataIncludeEmptyFields()
     {
-        return isset($this->includeEmptyFields) ? $this->includeEmptyFields : $this->clientType !== 'SOAP';
+        return isset($this->includeEmptyFields) ? $this->includeEmptyFields : $this->getClientType() !== 'SOAP';
     }
 
     /**
@@ -310,81 +330,104 @@ class Connection
     }
 
     /**
-     * Calls AFAS Update Connector with standard arguments and an XML string.
-     *
-     * @param $connector_name
-     *   Name of the Update Connector.
-     * @param string $xml
-     *   XML string as specified by AFAS. See their XSD Schemas, or use
-     *   AfasApiHelper::constructXML($connector_name, ...) as an argument to
-     *     this method if you would rather pass custom arrays than an XML
-     *     string.
-     *
-     * @return string
-     *   Response from SOAP call. Most successful calls return empty string.
-     *
-     * @throws \RuntimeException
-     *   If called for a REST client.
-     * @throws \UnexpectedValueException
-     *   If the SoapClient returned a response in an unknown format.
-     * @throws \Exception
-     *   If anything else went wrong. (e.g. a client specific error.)
-     *
-     * @deprecated We now have sendData which is more general and where you
-     *   can provide an array as the second parameter.
-     */
-    function sendXml($connector_name, $xml)
-    {
-        if ($this->clientType !== 'SOAP') {
-            throw new RuntimeException('sendXml() is not supported by REST clients.', 30);
-        }
-        return $this->client->callAfas('update', 'Execute', ['connectorType' => $connector_name, 'dataXml' => $xml]);
-    }
-
-    /**
      * Sends data to an AFAS Update Connector.
      *
-     * @param $connector_name
-     *   Name of the Update Connector.
-     * @param string|array $data
-     *   Data string to send in to the Update Connector; must be XML or JSON
-     *   depending on the client type. If this is an array, it will be converted
-     *   to a string using the helper class configured for this Connection.
-     * @param string $rest_verb
-     *   (optional) the HTTP verb representing the action to take: "POST" for
-     *   insert, "PUT" for update, "DELETE" for delete. Must be in upper case;
-     *   defaults to PUT. This also applies to SOAP clients if the $data
-     *   argument is an array: specify "POST" for inserting new data, because
-     *   this will influence how the XML is built.
+     * The first and second parameter could also be switched, but that usage
+     * is deprecated. (Note that the connector name is the first argument in
+     * getData(), and the second argument in sendData().)
+     *
+     * @param string|array|\PracticalAfas\UpdateConnector\UpdateObject $data
+     *   The data to send in to the Update Connector; can be:
+     *   - a string, which will be sent into the connector as-is. Must be JSON
+     *     or XML depending on the client type.
+     *   - an UpdateObject instance containing the data to send.
+     *   - an array, which will be passed into an UpdateObject to generate
+     *     the data to send.
+     * @param string $connector_name
+     *   (Optional) The name of the Update Connector. It is required if the
+     *   data is an array or a string.
+     * @param string $action
+     *   (Optional) The action to take on the data: "insert", "update" or
+     *   "delete". It is required if the data is an array, or if it's a string
+     *   and we are connecting to the REST API.
      *
      * @return string
      *   Response from SOAP call. Most successful calls return empty string.
+     *   (If a call is not successful, it is expected to throw an exception;
+     *   the details depend on the client.)
      *
+     * @throws \InvalidArgumentException
+     *   If any of the arguments are invalid (which includes invalid keys/
+     *   values in the array).
      */
-    function sendData($connector_name, $data, $rest_verb = 'PUT')
+    function sendData($data, $connector_name = '', $action = '')
     {
-        // We've specified a rest verb instead of "insert" / "update" / "delete"
-        // because this way, it is still easier to change things if necessary
-        // with regards to the $fields_action argument to the Helper methods.
-        // For now, there is a direct relation between the verb and the action.
-        // If there are ever situations in which this should change, then
-        // (documented) PRs are welcomed.
-        if (!is_string($data)) {
-            $actions = ['PUT' => 'update', 'POST' => 'insert', 'DELETE' => 'delete'];
-            $fields_action = isset($actions[$rest_verb]) ? $actions[$rest_verb] : '';
-            $class = $this->helperClassName;
+        // If $data is a simple string and $connector_name is not, then
+        // they are switched. We support this for backward compatibility;
+        // it was defined that way in v2.0.
+        if (is_string($data) && (!is_string($connector_name) || !preg_match('/^\w+$/', $connector_name))
+            && preg_match('/^\w+$/', $data)) {
+            $temp = $connector_name;
+            $connector_name = $data;
+            $data = $temp;
         }
 
-        if ($this->clientType === 'SOAP') {
+        $action = strtolower($action);
+        // We accept REST verbs POST/PUT/DELETE too, since this was the
+        // argument in v1 of this method. Implicitly convert by array_search.
+        $rest_verbs = ['update' => 'PUT', 'insert' => 'POST', 'delete' => 'DELETE'];
+        if ($action && !isset($rest_verbs[$action]) && !($action = array_search(strtoupper($action), $rest_verbs, true))) {
+            throw new InvalidArgumentException('Invalid action ' . var_export($action, true) . '.');
+        }
+
+        if ($data instanceof UpdateObject && $connector_name !== $data->getType()) {
+            throw new InvalidArgumentException("Provided connector name argument ($connector_name) differs from the type of UpdateObject ({$data->getType()}).");
+        } elseif (is_array($data)) {
+            // We'll require the action also for SOAP/XML. (The UpdateObject
+            // in practice will treat an empty string the same as "update" but
+            // it wants you to specify a nonempty string.)
+            if (!$action) {
+                throw new InvalidArgumentException('Action must be specified.');
+            }
+            $data = UpdateObject::create($connector_name, $data, $action);
+        }
+        if (!is_string($data) && !($data instanceof UpdateObject)) {
+            throw new InvalidArgumentException('Data is of invalid type.');
+        }
+
+        if ($this->getClientType() === 'SOAP') {
+            // $action is ignored, except (earlier) if an array was passed. We
+            // should not check it against the UpdateObject because in theory
+            // multiple actions can be defined for multiple elements present in
+            // the UpdateObject.
             if (!is_string($data)) {
-                $data = $class::constructXml($connector_name, $data, $fields_action);
+                $data = $data->output($this->getDataFormat());
             }
             $response = $this->client->callAfas('update', 'Execute', ['connectorType' => $connector_name, 'dataXml' => $data]);
         } else {
-            if (!is_string($data)) {
-                $data = json_encode($class::normalizeDataToSend($connector_name, $data, $fields_action));
+            if (is_string($data)) {
+                if (!$action) {
+                    throw new InvalidArgumentException('Action argument is required (insert, update or delete).');
+                }
+            } else {
+                // If we passed an UpdateObject into here, check it against the
+                // action argument. We do not support elements with different
+                // actions being sent over REST, because the action is tied to
+                // the verb - so if getAction() throws an exception, we want
+                // that to happen.
+                try {
+                    $temp = $data->getAction();
+                } catch (UnexpectedValueException $e) {
+                    throw new InvalidArgumentException('Data argument is an UpdateObject with several different actions set. This is not supported by REST clients.');
+                }
+                if ($action && $temp !== $action) {
+                    // We could just ignore $action but this seems like a
+                    // potentially dangerous mistake.
+                    throw new InvalidArgumentException("Provided action argument ($action) differs from action specified in the UpdateObject ($temp).");
+                }
+                $data = $data->output($this->getDataFormat());
             }
-            $response = $this->client->callAfas($rest_verb, "connectors/$connector_name", [], $data);
+            $response = $this->client->callAfas($rest_verbs[$action], 'connectors/' . rawurlencode($connector_name), [], $data);
         }
 
         return $response;
@@ -406,7 +449,19 @@ class Connection
      *   DATA_TYPE_TOKEN              : the user ID to request the token for.
      *   DATA_TYPE_VERSION_INFO       : this argument is ignored.
      * @param array $filters
-     *   (optional) Filters to apply before returning data.
+     *   (optional) Filters in our own custom format; one (or a combination) of:
+     *   1) [ FIELD1 => VALUE1, FIELD2 => VALUE2, ...,  '#op' => operator ],
+     *   2) [
+     *        [ FIELD1 => VALUE1, ..., '#op' => operator1 ],
+     *        [ FIELD2 => VALUE2, FIELD3 => VALUE3, ..., '#op' => operator2 ],
+     *      ]
+     *   FIELD2/VALUE2 and '#op' are optional; '#op' defaults to
+     *   Connection::OP_EQUAL. Both formats can represent one or more filters
+     *   on several fields (and formats can be mixed up); the second format
+     *   enables filtering on different operators. (For REST clients, all
+     *   operations can be either AND'ed or OR'ed together; this depends on the
+     *   $data_type parameter. For SOAP clients, only AND works.)
+     *   For the operator values, see the OP_* constants defined in this class.
      * @param string $data_type
      *   (optional) Type of data to retrieve / connector to call, and/or filter
      *   type. Defaults to GET_FILTER_AND / DATA_TYPE_GET (which is the same).
@@ -416,7 +471,10 @@ class Connection
      * @param array $extra_arguments
      *   (optional) Other arguments to pass to the API call, besides the ones
      *   in $filters / hardcoded for convenience. For GetConnectors these are:
-     *   - 'Skip' and 'Take' (see other documentation);
+     *   - 'Skip' and 'Take': at least one of these needs to be passed if the
+     *     data set is not known to be small (see return value docs): pass
+     *     'Skip' = -1 to return the full data set (at the risk of timeouts)
+     *     or pass the maximum number of rows to return in 'Take'.
      *   - 'OrderByFieldIds', to apply sorting, Syntax is
      *     "Fieldname1,-Fieldname2,..." (hyphen for descending order). This also
      *     works with SOAP clients. (It will be converted to an 'Index' option.)
@@ -436,19 +494,16 @@ class Connection
      * @return mixed
      *   Output; format is dependent on data type and extra arguments. The
      *   default output format is a two-dimensional array of rows/columns of
-     *   data from the GetConnector. The array structure is not exactly the same
-     *   for SOAP vs. REST clients:
-     *   - If the 'take' argument is not specified, the REST API will (always?)
-     *     return 100 rows maximum, and the SOAP client will return 1000 rows.
-     *     (This is a default passed by the code, because if no 'take' argument
-     *     is specified, the SOAP API will return no data. We do not want to
-     *     lower the value to be the same default of 100, since that has a
-     *     bigger chance of causing backward compatibility problems because
-     *     pre-2017, the 'take' argument was unnecessary.
-     *   - Empty fields will either not be returned by the SOAP endpoint or (if
-     *     specified through 'Outputoptions'/ setDataIncludeEmptyFields())
-     *     contain an empty string. Empty fields returned by the REST API will
-     *     contain null.
+     *   data from the GetConnector. The array structure is not exactly the
+     *   same for SOAP vs. REST clients:
+     *   - If the 'take' argument is not specified (and 'skip' is not -1), the
+     *     REST API endpoint will return 100 rows maximum; this is 1000 for the
+     *     SOAP API endpoint (for (backward compatibility; see comments at
+     *     parseGetDataArguments()).
+     *   - Empty fields will either not be returned by the SOAP API endpoint or
+     *     (if specified through 'Outputoptions'/ setDataIncludeEmptyFields())
+     *     contain an empty string. Empty fields returned by the REST API
+     *     endpoint will contain null.
      *
      * @throws \InvalidArgumentException
      *   If input arguments have an illegal value / unrecognized structure.
@@ -458,19 +513,25 @@ class Connection
      *   If anything else went wrong. (a remote error could throw e.g. a
      *   SoapFault depending on the client class used.)
      *
-     * @see parseGetDataArguments()
+     * @see parseFilters()
      */
     public function getData($data_id, array $filters = [], $data_type = self::DATA_TYPE_GET, array $extra_arguments = [])
     {
         // We're going to let AFAS report an error for wrong/empty scalar values
         // of data_id (e.g. connector), but at least throw here for any
         // non-scalar.
-        if ((!is_string($data_id) || $data_id === '') && !is_int($data_id)) {
-            throw new InvalidArgumentException("Invalid 'data_id' argument: " . json_encode($data_id), 32);
+        if ((!is_string($data_id) || $data_id === '') && !is_int($data_id) && $data_type !== self::DATA_TYPE_VERSION_INFO) {
+            if (!is_scalar($data_id)) {
+                $data_id = is_array($data_id) ? '[object]' : '[array]';
+            }
+            throw new InvalidArgumentException("Invalid 'data_id' argument: " . var_export($data_id, true), 32);
         }
         // Just in case the user specified something other than a constant:
         if (!is_string($data_type)) {
-            throw new InvalidArgumentException("Invalid 'data_type' argument: " . json_encode($data_type), 32);
+            if (!is_scalar($data_type)) {
+                $data_type = is_array($data_type) ? '[object]' : '[array]';
+            }
+            throw new InvalidArgumentException("Invalid 'data_type' argument: " . var_export($data_type, true), 32);
         }
         $data_type = strtolower($data_type);
         // Unify case of arguments, so we don't skip any validation. (If two
@@ -498,7 +559,7 @@ class Connection
         // 'Outputmode' was never a thing) and for REST clients (because
         // supposedly all output is JSON, therefore can be converted to an
         // array? @todo doublecheck this... This will get clear when more PRs are sent in.)
-        if ($this->clientType === 'SOAP' && $data_type !== self::DATA_TYPE_GET) {
+        if ($this->getClientType() === 'SOAP' && $data_type !== self::DATA_TYPE_GET) {
             // We want to return the literal return value from the endpoint.
             $output_format = self::GET_OUTPUTMODE_LITERAL;
         } else {
@@ -513,12 +574,15 @@ class Connection
             // only supported for SOAP.
             if (is_numeric($output_format)) {
                 $supported = $output_format == self::GET_OUTPUTMODE_LITERAL;
-            } elseif ($this->clientType === 'SOAP') {
+            } elseif ($this->getClientType() === 'SOAP') {
                 $supported = in_array($output_format, [self::GET_OUTPUTMODE_ARRAY, self::GET_OUTPUTMODE_SIMPLEXML], true);
             } else {
                 $supported = $output_format === self::GET_OUTPUTMODE_ARRAY;
             }
             if (!$supported) {
+                if (!is_scalar($output_format)) {
+                    $output_format = is_array($output_format) ? '[object]' : '[array]';
+                }
                 throw new InvalidArgumentException("AfasSoapConnection::getData() cannot handle handle output mode $output_format.", 30);
             }
         }
@@ -526,10 +590,10 @@ class Connection
         // 'Metadata' only makes sense for SOAP GetConnectors (where it
         // influences API return value) but may make sense for all REST API
         // calls (because we process the return value ourselves).
-        if ($this->clientType !== 'SOAP' || $data_type === self::DATA_TYPE_GET) {
+        if ($this->getClientType() !== 'SOAP' || $data_type === self::DATA_TYPE_GET) {
             if (isset($extra_arguments['options']['metadata'])) {
                 $include_metadata = !empty($extra_arguments['options']['metadata']);
-            } elseif ($this->clientType !== 'SOAP' && $output_format == self::GET_OUTPUTMODE_LITERAL) {
+            } elseif ($this->getClientType() !== 'SOAP' && $output_format == self::GET_OUTPUTMODE_LITERAL) {
                 // If the output format comes from $extra_arguments['options']['outputmode'],
                 // this overrides the value to true even though
                 // $this->getDataIncludeMetadata() will return false (because it
@@ -538,7 +602,7 @@ class Connection
             } else {
                 $include_metadata = $this->getDataIncludeMetadata();
             }
-            if (!$include_metadata && $this->clientType !== 'SOAP' && $output_format !== self::GET_OUTPUTMODE_ARRAY) {
+            if (!$include_metadata && $this->getClientType() !== 'SOAP' && $output_format !== self::GET_OUTPUTMODE_ARRAY) {
                 // For SOAP, this is implemented at the server side. For REST we
                 // have to process the output, which we only do for ARRAY.
                 throw new InvalidArgumentException("The getData() call is set to not return metadata. This is not supported by REST clients unless they have 'ARRAY' output format set.", 35);
@@ -570,7 +634,7 @@ class Connection
             $include_empty_fields = isset($extra_arguments['options']['outputoptions']) ?
                 $extra_arguments['options']['outputoptions'] == self::GET_OUTPUTOPTIONS_XML_INCLUDE_EMPTY
                 : $this->getDataIncludeEmptyFields();
-            if (!$include_empty_fields && $this->clientType !== 'SOAP') {
+            if (!$include_empty_fields && $this->getClientType() !== 'SOAP') {
                 // We could support this for REST too, at least for
                 // OUTPUTMODE_ARRAY which would mean processing output below.
                 throw new InvalidArgumentException("The getData() call is set to not return empty fields. This is not supported by REST clients.", 36);
@@ -583,7 +647,7 @@ class Connection
         // The SOAP GetDataWithOptions function's 'options' argument supports
         // more options than just above three. We have not seen these documented
         // in AFAS' online docs; they were probably added later (when AFAS added
-        // a REST API) and this class did support them before v1.2. They are
+        // a REST API) and this class did not support them before v1.2. They are
         // - 'Index', which is equivalent to REST's 'orderbyfieldids' except the
         //   value is XML. (We are now supporting this for SOAP but _not_ for
         //   REST clients. for writing portable getData() calls, use
@@ -622,7 +686,7 @@ class Connection
 
         // We split up the parsing of further arguments into methods per client
         // type because it's so different.
-        if ($this->clientType === 'SOAP') {
+        if ($this->getClientType() === 'SOAP') {
             if ($data_type === self::DATA_TYPE_GET) {
                 // Always add the 'options' parameters which we just validated.
                 if (isset($extra_arguments['options']) && !is_array($extra_arguments['options'])) {
@@ -662,7 +726,7 @@ class Connection
         // Now, numeric format == GET_OUTPUTMODE_LITERAL. Others need to be
         // processed.
         if (!is_numeric($output_format)) {
-            if ($this->clientType === 'SOAP') {
+            if ($this->getClientType() === 'SOAP') {
                 $doc_element = new SimpleXMLElement($data);
                 if ($output_format === self::GET_OUTPUTMODE_SIMPLEXML) {
                     $data = $doc_element;
@@ -749,7 +813,7 @@ class Connection
                 break;
 
             case self::DATA_TYPE_METAINFO_UPDATE:
-                // All metainfo can be retrieved by specifying empty  $data_id.
+                // All metainfo can be retrieved by specifying empty $data_id.
                 $function = 'metainfo' . (empty($data_id) ? '' : '/update/' . rawurlencode($data_id));
                 break;
 
@@ -762,7 +826,7 @@ class Connection
                 $function = "profitversion";
         }
         if (!$function) {
-            throw new InvalidArgumentException('Unknown data_type value: ' . json_encode($data_type), 32);
+            throw new InvalidArgumentException('Unknown data_type value: ' . var_export($data_type, true), 32);
         }
 
         return [$http_verb, $function, $extra_arguments];
@@ -857,21 +921,22 @@ class Connection
                         . '</' . ucfirst($option) . '>';
                 }
                 $extra_arguments['options'] = "<options>$options_str</options>";
-                // For get connectors that are called through App Connectors,
-                // there are 'skip/take' arguments, and we provide a default
-                // 'take' because if it is not specified, the output will be
-                // empty. (Further general validation is done in the Client
-                // class, but the job of hard coding a capped value does not
-                // belong in there.)
+                // We provide a default 'take' value because if it is not
+                // specified, the output will be empty. (Further general
+                // validation is done in the Client class, but it throws an
+                // exception if no value is specified. We don't want that here,
+                // so we stay at least a bit in sync with the REST endpoint
+                // which does return rows when no 'take' is specified.)
                 if (!isset($extra_arguments['take'])) {
-                    // 1000 happens to be the default/maximum number of records
+                    // 1000 happens to be the default/maximum number of rows
                     // returned if 'take' was specified as an 'options' argument
                     // (which we disallow) and was > 1000. A lower value seems
-                    // too big a compatibility break with pre-App Connectors. It
-                    // is different from the default for REST clients though,
-                    // which is 100. (And we don't raise the REST default to
-                    // 1000 because we prefer keeping the behavior close to the
-                    // AFAS REST API, rather than close to the SOAP client.)
+                    // too big a compatibility break with pre-App Connectors
+                    // (i.e. the SOAP endpoint before 2017). It is different
+                    // from the default for REST clients though, which is 100.
+                    // (And we don't raise the REST default to 1000 because we
+                    // prefer keeping the behavior close to the default REST
+                    // endpoint behavior, rather than close to the SOAP client.)
                     $extra_arguments['take'] = 1000;
                 }
                 break;
@@ -926,7 +991,7 @@ class Connection
                 $function = 'GetProductVersion';
         }
         if (!$function) {
-            throw new InvalidArgumentException('Unknown data_type value: ' . json_encode($data_type), 32);
+            throw new InvalidArgumentException('Unknown data_type value: ' . var_export($data_type, true), 32);
         }
 
         return [$data_type, $function, $extra_arguments];
@@ -936,10 +1001,10 @@ class Connection
      * Constructs filter options, usable by AFAS REST call.
      *
      * @param array $filters
-     *   Filters in our own custom format; see parseFilters().
+     *   Filters in our own custom format; see getData().
      * @param bool $or
-     *   True if individual field-value pairs should be joined with OR instead
-     *   of AND.
+     *   (optional) True if individual field-value pairs should be joined with
+     *   OR instead of AND.
      *
      * @return array
      *   The query arguments that make up a filter. (These are always query
@@ -950,7 +1015,7 @@ class Connection
      * @throws \InvalidArgumentException
      *   If the input argument has an unrecognized structure.
      *
-     * @see parseFilters()
+     * @see getData()
      */
     protected static function parseRestFilters(array $filters, $or = false)
     {
@@ -958,8 +1023,18 @@ class Connection
         if ($filters) {
             $operator = !empty($filters['#op']) ? $filters['#op'] : self::OP_EQUAL;
             if (!is_numeric($operator) || $operator < 1 || $operator > 14) {
-                throw new InvalidArgumentException('Unknown filter operator: ' . json_encode($operator), 33);
+                if (!is_scalar($operator)) {
+                    $operator = is_array($operator) ? '[object]' : '[array]';
+                }
+                throw new InvalidArgumentException("Unknown filter operator: $operator.", 33);
             }
+            // Mixing filter formats (that is: having array values in the outer
+            // array which are both scalars and arrays) is allowed. If the
+            // values are arrays, keys are ignored; if they are scalars, keys
+            // are the field values. The end result is the same, regardless
+            // whether a field-value pair is inside an inner array. If an
+            // (outer or inner) array only contains one single '#op' value,
+            // it's  silently ignored.
             foreach ($filters as $outerfield => $filter) {
                 if ($outerfield !== '#op') {
 
@@ -967,19 +1042,27 @@ class Connection
                         // Process all fields on an inner layer.
                         $op = !empty($filter['#op']) ? $filter['#op'] : self::OP_EQUAL;
                         if (!is_numeric($op) || $op < 1 || $op > 14) {
-                            throw new InvalidArgumentException('Unknown filter operator: ' . json_encode($operator), 33);
+                            if (!is_scalar($op)) {
+                              $op = is_array($op) ? '[object]' : '[array]';
+                            }
+                            throw new InvalidArgumentException("Unknown filter operator: $op (for key: $outerfield).", 33);
                         }
                         foreach ($filter as $key => $value) {
                             if ($key !== '#op') {
 
                                 if (is_array($value)) {
-                                    throw new InvalidArgumentException('Filter has more than two array dimensions: ' . json_encode($filters), 33);
+                                    throw new InvalidArgumentException("Filter has more than two array dimensions (for key: $outerfield; field: $key).", 33);
+                                }
+                                if (!is_scalar($value)) {
+                                  throw new InvalidArgumentException("Filter contains a non-scalar value (for key: $outerfield; field: $key).", 33);
                                 }
                                 $fields[] = $key;
                                 $values[] = $value;
                                 $operators[] = $op;
                             }
                         }
+                    } elseif (!is_scalar($filter)) {
+                        throw new InvalidArgumentException("Filter contains a non-scalar value (for field: $outerfield).", 33);
                     } else {
                         // Process 1 field on the outer layer.
                         $fields[] = $outerfield;
@@ -994,9 +1077,9 @@ class Connection
             // The glue is the same in all 3 arguments. Why? That's why.
             $glue = $or ? ';' : ',';
             $arguments = [
-                'filterfieldids' => join($glue, $fields),
-                'filtervalues' => join($glue, $values),
-                'operatortypes' => join($glue, $operators),
+                'filterfieldids' => implode($glue, $fields),
+                'filtervalues' => implode($glue, $values),
+                'operatortypes' => implode($glue, $operators),
             ];
         }
 
@@ -1007,77 +1090,42 @@ class Connection
      * Constructs a 'FiltersXML' argument, usable by AFAS SOAP call.
      *
      * @param array $filters
-     *   Filters in our own custom format:
-     *   1) [ FIELD1 => VALUE1, ...,  '#op' => operator ], to filter on one or
-     *      several values. The '#op' key is optional and defaults to OP_EQUAL.
-     *   2) [
-     *        [ FIELD1 => VALUE1, ..., '#op' => operator1 ],
-     *        [ FIELD2 => VALUE2, ..., '#op' => operator2 ],
-     *      ]
-     *     This supports different operators but is harder to write/read. All
-     *     sub-arrays are AND'ed together; AFAS GetConnectors do not support the
-     *     'OR' operator here.
-     *
-     *   Mixing the formats up (that is: having array values in the _outer_
-     *   array which are both scalars and arrays) is allowed. If the values are
-     *   arrays, keys are ignored; if they are scalars, keys are the field
-     *   values. The end result is the same, regardless whether a field-value
-     *   pair is inside an inner array; the returned result is a one-dimensional
-     *   list of field-value-operator combinations.
-     *   If an (outer or inner) array only contains one single '#op' value, it's
-     *   silently ignored.
-     *   For the operator values, see the OP_* constants defined in this class.
-     *
+     *   Filters in our own custom format; see getData().
      * @return string
      *   The filters formatted as 'FiltersXML' argument. (If the input is empty
-     *   or only contains an '#op',  then the XML will contain a few tags with
+     *   or only contains an '#op', then the XML will contain a few tags with
      *   no content; the effect of this is untested. It seems nothing will go
      *   wrong then, but it's better to just not call this with empty input.)
      *
      * @throws \InvalidArgumentException
      *   If the input argument has an unrecognized structure.
+     *
+     * @see getData()
      */
     protected static function parseFilters(array $filters)
     {
         $filters_str = '';
-        if ($filters) {
-            $operator = !empty($filters['#op']) ? $filters['#op'] : self::OP_EQUAL;
-            if (!is_numeric($operator) || $operator < 1 || $operator > 14) {
-                throw new InvalidArgumentException('Unknown filter operator: ' . json_encode($operator), 33);
-            }
-            foreach ($filters as $outerfield => $filter) {
-                if ($outerfield !== '#op') {
-
-                    if (is_array($filter)) {
-                        // Process all fields on an inner layer.
-                        $op = !empty($filter['#op']) ? $filter['#op'] : self::OP_EQUAL;
-                        if (!is_numeric($op) || $op < 1 || $op > 14) {
-                            throw new InvalidArgumentException('Unknown filter operator: ' . json_encode($operator), 33);
-                        }
-                        foreach ($filter as $key => $value) {
-                            if ($key !== '#op') {
-
-                                if (is_array($value)) {
-                                    throw new InvalidArgumentException('Filter has more than two array dimensions: ' . json_encode($filters), 33);
-                                }
-                                $filters_str .= '<Field FieldId="' . $key . '" OperatorType="' . $op . '">' . static::xmlValue($value) . '</Field>';
-                            }
-                        }
-                    } else {
-                        // Process 1 field on the outer layer.
-                        $filters_str .= '<Field FieldId="' . $outerfield . '" OperatorType="' . $operator . '">' . static::xmlValue($filter) . '</Field>';
-                    }
-                }
+        // Prevent code duplication. That means we have to explode the
+        // just-imploded strings again, but we can live with that. (An
+        // alternative is to provide an extra internal-type argument...)
+        $args = static::parseRestFilters($filters);
+        if ($args) {
+            // We know all 3 will yield equally long arrays.
+            $fields = explode(',', $args['filterfieldids']);
+            $values = explode(',', $args['filtervalues']);
+            $operators = explode(',', $args['operatortypes']);
+            foreach ($fields as $key => $field) {
+                $filters_str .= '<Field FieldId="' . $field . '" OperatorType="' . $operators[$key] . '">'
+                    . static::xmlValue($values[$key]) . '</Field>';
             }
         }
-
         // There can be multiple 'Filter' tags with multiple FilterIds. We only
         // need to use one, it can contain all our filtered fields.
         return '<Filters><Filter FilterId="Filter1">' . $filters_str . '</Filter></Filters>';
     }
 
     /**
-     * Prepare a value for inclusion in XML: trim and encode.
+     * Encode a value for inclusion in XML.
      *
      * @param string $text
      *
@@ -1085,10 +1133,6 @@ class Connection
      */
     protected static function xmlValue($text)
     {
-        // check_plain() / ENT_QUOTES converts single quotes to &#039; which is
-        // illegal in XML so we can't use it for sanitizing.) The below is
-        // equivalent to "htmlspecialchars($text, ENT_QUOTES | ENT_XML1)", but
-        // also valid in PHP < 5.4.
-        return str_replace("'", '&apos;', htmlspecialchars(trim($text)));
+        return htmlspecialchars($text, ENT_QUOTES | ENT_XML1);
     }
 }

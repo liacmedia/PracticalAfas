@@ -9,16 +9,27 @@
  */
 
 use PHPUnit\Framework\TestCase;
+use PracticalAfas\UpdateConnector\KnBasicAddress;
 use PracticalAfas\UpdateConnector\UpdateObject;
 use PracticalAfas\UpdateConnector\OrgPersonContact;
 use PracticalAfas\TestHelpers\ArraysObject;
 
+/**
+ * Tests for UpdateObject and child classes.
+ *
+ * There's so much to test that this does not try to adhere to any structure
+ * like tests for each method. Also a lot of things are tested implicitly in
+ * tests for other things. I just stopped writing tests when I stopped thinking
+ * of functionality that could break.
+ */
 class UpdateObjectTest extends TestCase
 {
     /**
      * Runs through example payloads; verifies UpdateObject output matches them.
      *
-     * This implicitly tests a lot of things; among others, whether embedded
+     * Also tests whether we can set JSON output back into the object.
+     *
+     * This implicitly tests a lot more things; among others, whether embedded
      * objects are properly formatted.
      */
     public function testOutput()
@@ -28,12 +39,14 @@ class UpdateObjectTest extends TestCase
                 $filename = __DIR__ . "/update_examples/$dir_entry";
                 /** @var \PracticalAfas\UpdateConnector\UpdateObject $object */
                 list($object, $change_behavior, $expected_json, $expected_xml) = $this->readUpdateExample($filename);
-
                 $clone = clone $object;
-                $test = $object->output('json', ['pretty' => true], $change_behavior);
-                $this->assertSame($expected_json, $test, "JSON output does not match the contents of $filename.");
-                $test = $object->output('xml', ['pretty' => true], $change_behavior);
-                $this->assertSame($expected_xml, $test, "XML output does not match the contents of $filename.");
+
+                // Test that for the array structure in a file as input, the
+                // output matches the JSON/XML contents in the same file.
+                $output = $object->output('xml', ['pretty' => true], $change_behavior);
+                $this->assertSame($expected_xml, $output, "XML output does not match the contents of $filename.");
+                $output = $object->output('json', ['pretty' => true], $change_behavior);
+                $this->assertSame($expected_json, $output, "JSON output does not match the contents of $filename.");
 
                 // Test that the object is still the same after validation /
                 // output, so validation did not change any properties of the
@@ -65,9 +78,40 @@ class UpdateObjectTest extends TestCase
                         }
                         $this->assertEquals($clone, $object);
                     }
+
+                    // Check if we can set the full JSON output (if converted
+                    // back to the array). Difference with above: this has
+                    // 'Element' wrapper(s) and an outer wrapper containing the
+                    // object type; setElements() should be able to deal with
+                    // that format too.
+                    $test = json_decode($output, true);
+                    $object->setElements($test);
+                    // Now we can't compare to $clone because we will have
+                    // explicitly set all the defaults as object values. But we
+                    // hope the output of both is still equal. (Except for the
+                    // order of fields, which can e.g. be added on later by
+                    // child classes in one case and not the other.)
+                    $output = $object->output('json', ['pretty' => true], $change_behavior);
+                    $test2 = json_decode($output, true);
+                    self::sortRecursiveKeys($test);
+                    self::sortRecursiveKeys($test2);
+                    $this->assertEquals($test2, $test);
                 }
             }
         }
+    }
+
+    /**
+     * Sort an array's keys recursively.
+     *
+     * @param array $array
+     *   The array to sort
+     */
+    private static function sortRecursiveKeys(array &$array) {
+       foreach ($array as &$value) {
+          if (is_array($value)) self::sortRecursiveKeys($value);
+       }
+       ksort($array);
     }
 
     /**
@@ -115,7 +159,7 @@ class UpdateObjectTest extends TestCase
         $this->assertEquals([], $object1->getElements());
 
         // See whether setting empty elements works OK.
-        $object2 = UpdateObject::create('KnPerson', [ [], [] ], 'update');
+        $object2 = UpdateObject::create('KnPerson', [[], []], 'update');
         // This adds nothing.
         $object2->addElements([]);
         // This adds a single empty element.
@@ -149,7 +193,7 @@ class UpdateObjectTest extends TestCase
 
         // Check that output() on en empty object throws an exception.
         $this->expectException(UnexpectedValueException::class);
-        $this->expectExceptionMessage("'KnPerson' object holds no elements.");
+        $this->expectExceptionMessage("Object holds no elements.");
         // We want an empty object without default values, so ALLOW_NO_CHANGES.
         // For KnPerson, if we don't set VALIDATE_NOTHING, we still get the
         // special MatchPer field.
@@ -205,17 +249,8 @@ class UpdateObjectTest extends TestCase
 
         // An update action should not work without an ID.
         $this->expectException(UnexpectedValueException::class);
-        $this->expectExceptionMessage("'@SbId' property in 'KnSubject' element must have a value, or Action 'update' must be set to 'insert'.");
+        $this->expectExceptionMessage("'@SbId' property must have a value, or Action 'update' must be set to 'insert'.");
         $object2->getElements(UpdateObject::DEFAULT_CHANGE, UpdateObject::DEFAULT_VALIDATION);
-    }
-
-    /**
-     * Test setting invalid object throws OutOfBoundsException.
-     */
-    public function testSetInvalidElementData()
-    {
-        $this->expectException(OutOfBoundsException::class);
-        UpdateObject::create('KnPerson', ['unknown' => 'value']);
     }
 
     /**
@@ -242,64 +277,209 @@ class UpdateObjectTest extends TestCase
     }
 
     /**
-     * Cause an exception message that reports on a non-'first' element.
-     *
-     * This serves as at least a cursory a test that the $element_index
-     * parameter is being passed through correctly.
+     * Test that multiple errors on input are all logged.
      */
-    public function testNonFirstErrorMessage1()
+    public function testMultipleMessages()
     {
         $properties = [
-            'line_items' => [
-                [],
-                // This does not need a separate test for it, but: below is an
-                // array so is interpreted as having field name '0'.
-                ['quantity'],
+            [
+                // 3 errors in the same object, of which 1 in an embedded one.
+                'unit' => 2.2,
+                'backorder' => '',
+                'line_items' => [
+                    [],
+                    // Below is an array so is interpreted as having field '0'.
+                    ['quantity'],
+                ],
+            ],
+            [
+                // This one should be fine.
+                'backorder' => 'False',
+                'line_items' => [
+                    [],
+                    [],
+                    ['quantity' => '3'],
+                ]
+            ],
+            [
+                // This again contains 4 errors, 3 of which embedded.
+                'backorder' => 2,
+                'line_items' => [
+                    [],
+                    [],
+                    [
+                        // Both are the same field. Despite having the same
+                        // value, that's seen as an (additional) error.
+                        'quantity' => 'three',
+                        'QuUn' => 'three',
+                    ],
+                ]
+            ],
+        ];
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage("element-key 0: object-ref FbSalesLines: element-key 1: Unknown element properties provided: names are '0'.
+element-key 0: 'BkOr' (backorder) field value is not a valid boolean value.
+element-key 0: 'Unit' (unit) field value is not a valid integer value.
+element-key 2: object-ref FbSalesLines: element-key 2: Field value is provided by both its field name QuUn and alias quantity.
+element-key 2: object-ref FbSalesLines: element-key 2: 'QuUn' (quantity) field value is not numeric.
+element-key 2: object-ref FbSalesLines: element-key 2: 'QuUn' (quantity) field value is not numeric.
+element-key 2: 'BkOr' (backorder) field value is not a valid boolean value.");
+        UpdateObject::create('FbSales', $properties, 'update');
+    }
+
+    /**
+     * Tests that overriding definition generally works.
+     */
+    public function testDefinitionOverrides()
+    {
+        $properties = [
+            'order_date' => '2018-12-10',
+            'order_number' => '1',
+            'debtor_id' => 1,
+            'currency_code' => 'EUR',
+        ];
+        $object1 = UpdateObject::create('FbSales', $properties, 'insert');
+
+        // Override field definitions: we must use complete definitions, keyed
+        // by 'fields'.
+        $definitions = [
+            'fields' => [
+                // Comment will be reqired.
+                'Re' => [
+                    'alias' => 'comment',
+                    'required' => true,
+                ],
+                'U1234567890' => [
+                    'alias' => 'custom_field_1',
+                ],
+            ],
+        ];
+        UpdateObject::overridePropertyDefinitions('FbSales', $definitions);
+
+        // The definition for custom_field_1 would have made above create()
+        // error out (which we are assuming without testing it explicitly) but
+        // is fine here.
+        $properties += [
+            'custom_field_1' => '2',
+        ];
+        $object2 = UpdateObject::create('FbSales', $properties, 'insert');
+
+        // The order_date field is now required in $object2, but still not
+        // required in $object1.
+        $object1->output();
+        $this->expectException(UnexpectedValueException::class);
+        $this->expectExceptionMessage("No value provided for required 'Re' (comment) field.");
+        $object2->output();
+    }
+
+    /**
+     * Tests that overriding single properties (default, alias) works.
+     *
+     * Also tests that the 'street splitting' only works for certain countries.
+     */
+    public function testPropertyOverridesAndStreetLogic()
+    {
+        // In other places, we use readUpdateExample() to get some sample data.
+        // But here, we'd like to have the input array instead of the object.
+        // We'll just copy the definitions here.
+        $properties = [
+          'name' => 'Wyz',
+          'address' => [
+            'street' => 'Govert Flinckstraat 168A',
+            'postal_code' => '1072EP',
+            'town' => 'Amsterdam',
+          ],
+        ];
+        $expected = [[
+            'Fields' => [
+                'Nm' => 'Wyz',
+                'MatchOga' => 6,
+                'PbAd' => true,
+                'AutoNum' => true,
+            ],
+            'Objects' => [
+                'KnBasicAddressAdr' => [
+                    'Element' => [
+                        'Fields' => [
+                            'Ad' => 'Govert Flinckstraat',
+                            'ZpCd' => '1072EP',
+                            'Rs' => 'Amsterdam',
+                            'CoId' => 'NL',
+                            'HmNr' => 168,
+                            'HmAd' => 'A',
+                            'PbAd' => false,
+                            'ResZip' => false,
+                        ]
+                    ]
+                ],
             ]
-        ];
-        $this->expectException(OutOfBoundsException::class);
-        $this->expectExceptionMessage("Unknown element properties provided for 'FbSalesLines' element which will get index 1: names are '0'.");
-        UpdateObject::create('FbSales', $properties, 'update');
+        ]];
+        // We know the above with country 'NL' and alias 'zip_code' will be
+        // good because we tested that in KnOrg-embedded-update.txt. We'll test
+        // whether the same works when overriding an alias and having 'NL' only
+        // as default.
+        UpdateObject::overrideFieldProperty('KnBasicAddress', 'CoId', 'default', 'NL');
+        UpdateObject::overrideFieldProperty('KnBasicAddress', 'ZpCd', 'alias', 'postal_code');
+        $actual = UpdateObject::create('KnOrganisation', $properties, 'insert')
+            ->getElements(UpdateObject::DEFAULT_CHANGE | UpdateObject::ALLOW_CHANGES, UpdateObject::DEFAULT_VALIDATION);
+        $this->assertEquals($expected, $actual);
+
+        // If we however remove the default, the street does not get split
+        // anymore.
+        UpdateObject::unOverrideFieldProperty('KnBasicAddress', 'CoId', 'default');
+        $actual = UpdateObject::create('KnOrganisation', $properties, 'insert')
+            ->getElements(UpdateObject::DEFAULT_CHANGE | UpdateObject::ALLOW_CHANGES, UpdateObject::DEFAULT_VALIDATION);
+        $this->assertNotEquals(
+            $expected[0]['Objects']['KnBasicAddressAdr']['Element']['Fields']['Ad'],
+            $actual[0]['Objects']['KnBasicAddressAdr']['Element']['Fields']['Ad']
+        );
+
+
+        // Also if we re-add the default but remove 'NL' from the list of
+        // countries, the street does not get split anymore.
+        UpdateObject::overrideFieldProperty('KnBasicAddress', 'CoId', 'default', 'NL');
+        KnBasicAddress::setCountriesWithSeparateHouseNr(array_diff(
+            KnBasicAddress::getCountriesWithSeparateHouseNr(),
+            ['NL']
+        ));
+        $actual = UpdateObject::create('KnOrganisation', $properties, 'insert')
+            ->getElements(UpdateObject::DEFAULT_CHANGE | UpdateObject::ALLOW_CHANGES, UpdateObject::DEFAULT_VALIDATION);
+        $this->assertNotEquals(
+            $expected[0]['Objects']['KnBasicAddressAdr']['Element']['Fields']['Ad'],
+            $actual[0]['Objects']['KnBasicAddressAdr']['Element']['Fields']['Ad']
+        );
+        // ...though the country is still NL, unlike the previous code block.
+        $this->assertEquals('NL', $actual[0]['Objects']['KnBasicAddressAdr']['Element']['Fields']['CoId']);
+
+        // Reset settings for further tests.
+        UpdateObject::unOverrideFieldProperty('KnBasicAddress');
     }
 
     /**
-     * Same as testNonFirstErrorMessage1 but an error in validateFieldValue().
-     *
-     * Also: test that decimal fields cannot contain strings.
+     * Tests that if one element fails, none of the elements get set.
      */
-    public function testNonFirstErrorMessage2()
+    public function testErrorInOneElementCancelsAll()
     {
         $properties = [
             [
+                'backorder' => 'False',
                 'line_items' => [
-                    [],
-                    [],
-                    ['quantity' => '1'],
+                    ['quantity' => '3'],
                 ]
             ],
             [
-                'line_items' => [
-                    [],
-                    [],
-                    ['quantity' => 'x'],
-                ]
+                'backorder' => 'TRU',
             ],
         ];
-        $this->expectException(InvalidArgumentException::class);
-        // The message is confined within one object (i.e. 'line_items' and
-        // does not indicate any parent element it would be embedded in.
-        $this->expectExceptionMessage("'QuUn' (quantity) field value of 'FbSalesLines' element which has (or will get) index 2 must be numeric.");
-        UpdateObject::create('FbSales', $properties, 'update');
-    }
-
-    /**
-     * Test that non-integer fields throw an exception.
-     */
-    public function testNonIntegerException()
-    {
-        $this->expectException(InvalidArgumentException::class);
-        $this->expectExceptionMessage("'Unit' (unit) field value of 'FbSales' element must be an integer value.");
-        UpdateObject::create('FbSales', ['unit' => 1.2], 'update');
+        // Add the first (correct) element twice, proving we can do this.
+        $object = UpdateObject::create('FbSales', $properties[0], 'update');
+        $object->addElements([$properties[0]]);
+        // Add both elements again; see that neither of them is added.
+        try {
+            $object->addElements($properties);
+        } catch (InvalidArgumentException $exception) {
+        }
+        $this->assertEquals(2, count($object->getElements()));
     }
 
     /**
@@ -313,7 +493,7 @@ class UpdateObjectTest extends TestCase
             'address' => [[], []],
         ];
         $this->expectException(InvalidArgumentException::class);
-        $this->expectExceptionMessage("'KnBasicAddressAdr' (address) object embedded in 'KnOrganisation' element contains 2 elements but can only contain a single element.");
+        $this->expectExceptionMessage("Embedded object 'KnBasicAddressAdr' (address) contains 2 elements but can only contain a single element.");
         UpdateObject::create('KnOrganisation', $properties, 'update');
     }
 
@@ -328,7 +508,7 @@ class UpdateObjectTest extends TestCase
         $object = UpdateObject::create('KnOrganisation', $properties, 'update', UpdateObject::VALIDATE_NOTHING);
         $object->getElements();
         $this->expectException(UnexpectedValueException::class);
-        $this->expectExceptionMessage("'KnBasicAddressAdr' (address) object embedded in 'KnOrganisation' element contains 2 elements but can only contain a single element.");
+        $this->expectExceptionMessage("Embedded object 'KnBasicAddressAdr' (address) contains 2 elements but can only contain a single element.");
         $object->output();
     }
 
@@ -342,7 +522,7 @@ class UpdateObjectTest extends TestCase
         $this->expectException(UnexpectedValueException::class);
         // Org/Contact/Person objects contain no required values that are not
         // populated. Only the address field contains one.
-        $this->expectExceptionMessage("No value provided for required 'PbAd' (is_po_box) field of 'KnBasicAddress' element.");
+        $this->expectExceptionMessage("No value provided for required 'PbAd' (is_po_box) field.");
         $object->getElements(UpdateObject::ALLOW_NO_CHANGES, UpdateObject::DEFAULT_VALIDATION);
     }
 
@@ -362,6 +542,8 @@ class UpdateObjectTest extends TestCase
     /**
      * Test a class which can contain 'metadata' for fields.
      *
+     * This also implicitly tests that UpdateObject::overrideClass() works.
+     *
      * This theoretical example is mostly meant to provide some extra testing
      * for validation; to see if nothing goes wrong if we pass array values
      * through all those functions, and only validateFieldValue() needs to be
@@ -375,7 +557,8 @@ class UpdateObjectTest extends TestCase
             // also do non-array value
         ];
         // This should store things as arrays...
-        $object = ArraysObject::create('KnSubject', $properties, 'insert');
+        UpdateObject::overrideClass('KnSubject', '\PracticalAfas\TestHelpers\ArraysObject');
+        $object = UpdateObject::create('KnSubject', $properties, 'insert');
         // ...and getFields() should still get those arrays returned, because
         // it does not do any kind of validation/change...
         $this->assertEquals([1, 'meta'], $object->getField('type'));
@@ -409,8 +592,8 @@ class UpdateObjectTest extends TestCase
      */
     public function testContactNoEmbeddedPerson()
     {
-        $this->expectException(OutOfBoundsException::class);
-        $this->expectExceptionMessage("Unknown element properties provided for 'KnContact' element: names are 'person'.");
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage("Unknown element properties provided: names are 'person'.");
         $properties = [
             'email' => 'rm@wyz.biz',
             'phone' => '+31622517218',
@@ -436,8 +619,8 @@ class UpdateObjectTest extends TestCase
         $object = UpdateObject::create('KnContact', $properties, 'update');
 
         $this->expectException(UnexpectedValueException::class);
-        $this->expectExceptionMessage("No value provided for required 'BcCoOga' (organisation_code) field of 'KnContact' element.
-No value provided for required 'BcCoPer' (person_code) field of 'KnContact' element.");
+        $this->expectExceptionMessage("No value provided for required 'BcCoOga' (organisation_code) field.
+No value provided for required 'BcCoPer' (person_code) field.");
         $object->getElements(UpdateObject::DEFAULT_CHANGE, UpdateObject::DEFAULT_VALIDATION);
     }
 
@@ -457,7 +640,7 @@ No value provided for required 'BcCoPer' (person_code) field of 'KnContact' elem
             'phone' => '+3162251721',
             'contact' => [
                 'address' => [
-                  'country_iso' => 'NL',
+                    'country_iso' => 'NL',
                 ],
             ],
         ];
@@ -469,6 +652,10 @@ No value provided for required 'BcCoPer' (person_code) field of 'KnContact' elem
      */
     public function testValidateDutchPhoneNr1a()
     {
+        UpdateObject::overrideClass('KnBasicAddress', '\PracticalAfas\TestHelpers\ArraysAddress');
+        UpdateObject::overrideClass('KnContact', '\PracticalAfas\TestHelpers\ArraysOPC');
+        UpdateObject::overrideClass('KnPerson', '\PracticalAfas\TestHelpers\ArraysOPC');
+
         $this->expectException(InvalidArgumentException::class);
         $this->expectExceptionMessage("Phone number 'TeNr' has invalid format.");
         $properties = [
@@ -481,7 +668,7 @@ No value provided for required 'BcCoPer' (person_code) field of 'KnContact' elem
                 ],
             ],
         ];
-        ArraysObject::create('KnPerson', $properties, 'update', UpdateObject::DEFAULT_VALIDATION | OrgPersonContact::VALIDATE_FORMAT);
+        UpdateObject::create('KnPerson', $properties, 'update', UpdateObject::DEFAULT_VALIDATION | OrgPersonContact::VALIDATE_FORMAT);
     }
 
     /**
@@ -513,6 +700,10 @@ No value provided for required 'BcCoPer' (person_code) field of 'KnContact' elem
      */
     public function testValidateDutchPhoneNr2a()
     {
+        UpdateObject::overrideClass('KnBasicAddress', '\PracticalAfas\TestHelpers\ArraysAddress');
+        UpdateObject::overrideClass('KnContact', '\PracticalAfas\TestHelpers\ArraysOPC');
+        UpdateObject::overrideClass('KnOrganisation', '\PracticalAfas\TestHelpers\ArraysOPC');
+
         $properties = [
             'name' => ['Wyz', 7],
             'address' => [

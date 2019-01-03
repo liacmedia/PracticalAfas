@@ -13,17 +13,28 @@ namespace PracticalAfas\Client;
 use InvalidArgumentException;
 use SoapParam;
 use SoapVar;
+use RuntimeException;
 use UnexpectedValueException;
 
 /**
- * Wrapper around client specific details of making a remote AFAS call.
+ * Client for getting/sending data from/to AFAS, using SOAP API & php-soap ext.
  *
- * This class contains one public method: callAfas(), and uses
- * - the SOAP library bundled with PHP5;
- * - An 'app connector' for authentication.
+ * This class takes care of authentication / connection details but has no
+ * logic around interpreting any results. On any error, an exception is thrown.
+ *
+ * It has no official interface. It contains two public methods:
+ * - getClientType(): a static method which may be needed when not using this
+ *   class standalone.
+ * - callAfas(): the only method needed in order to make calls to AFAS. The
+ *   arguments and return value may differ depending on the client type.
  */
 class SoapAppClient
 {
+    public static function getClientType()
+    {
+      return 'SOAP';
+    }
+
     /**
      * Configuration options.
      *
@@ -32,9 +43,16 @@ class SoapAppClient
     protected $options;
 
     /**
+     * Options to pass into the SOAP client.
+     *
+     * @var array
+     */
+    protected $soapClientOptions;
+
+    /**
      * The SOAP client.
      *
-     * @var \PracticalAfas\NtlmSoapClient
+     * @var \SoapClient
      */
     protected $soapClient;
 
@@ -52,26 +70,28 @@ class SoapAppClient
      * constructor and throw an exception if we know any AFAS calls will fail.
      *
      * @param array $options
-     *   Configuration options. Some of them are used for configuring the actual
-     *   NtlmSoapClient class; some are used as standard arguments in each SOAP
-     *   call, some are used for both. Keys used:
+     *   Configuration options used by this class.
      *   Required:
      *   - customerId:      Customer ID, as used in the AFAS endpoint URL.
      *   - appToken:        Token used for the App connector.
      *   Optional:
+     *   - environment:     Which AFAS environment to connect to. Can be 'test'
+     *                      or 'accept'; if not specified, the client connects
+     *                      to the live environment.
      *   - soapClientClass: classname for the actual Soap client to use. Should
      *     be compatible with PHP's SoapClient.
      *   - useWSDL:         boolean. (Suggestion: don't set it.)
      *   - cacheWSDL:       How long the WSDL should be cached locally in
      *     seconds. Other options (which are usually not camelCased but
      *     under_scored) are specific to the actual Soap client.
-     *
+     * @param array $soap_client_options
+     *   (Optional) Configuration options for the SOAP client class.
      * @throws \InvalidArgumentException
      *   If some option values are missing / incorrect.
      * @throws \Exception
      *   If something else went wrong / option values are unsupported.
      */
-    public function __construct(array $options)
+    public function __construct(array $options, $soap_client_options = [])
     {
         foreach (['customerId', 'appToken'] as $required_key) {
             if (empty($options[$required_key])) {
@@ -80,13 +100,30 @@ class SoapAppClient
             }
         }
 
-        // Add defaults for the SOAP client.
         $options += [
-            'encoding' => 'utf-8',
             'soapClientClass' => '\SoapClient',
         ];
+        // Add defaults for the SOAP client. (Some more defaults which are only
+        // set if the client does not use WSDL, are in getSoapClient().)
+        $soap_client_options += [
+            'encoding' => 'utf-8',
+        ];
+        // From ~november 2018, AFAS has a new endpoint that forces TLS 1.2 as
+        // a minimum. We know how to force a specific TLS version but
+        // apparently cannot specify '1.2 or higher'. If people want TLS 1.3 or
+        // higher, they will have to pass their own stream_context option.
+        if ($options['soapClientClass'] === '\SoapClient'
+            && !isset($soap_client_options['stream_context'])) {
+            if (!defined('STREAM_CRYPTO_METHOD_TLSv1_2_CLIENT')) {
+                throw new RuntimeException("PHP's OpenSSL extension does not support TLS v1.2, which AFAS requires.");
+            }
+            $soap_client_options['stream_context'] = stream_context_create(
+                ['ssl' => ['crypto_method' => STREAM_CRYPTO_METHOD_TLSv1_2_CLIENT]]
+            );
+        }
 
         $this->options = $options;
+        $this->soapClientOptions = $soap_client_options;
     }
 
     /**
@@ -97,8 +134,8 @@ class SoapAppClient
      * @param string $endpoint
      *   (optional) The SOAP endpoint URL to use. (It's generally not necessary
      *   to set this because AFAS has a well defined structure for its endpoint
-     *   URLs. If this somehow changes, it's possible to pass this argument in
-     *   a subclass to override the defaults.)
+     *   URLs. If this somehow changes, it's possible to create a child class
+     *   that overrides getSoapClient() to pass an endpoint to this parent.
      *
      * @return \SoapClient
      *   Initialized SoapClient object.
@@ -114,12 +151,13 @@ class SoapAppClient
             } else {
                 $connector_path = 'appconnector' . strtolower($type);
             }
-            $endpoint = 'https://' . $this->options['customerId'] . ".afasonlineconnector.nl/profitservices/$connector_path.asmx";
+            $env = !empty($this->options['environment']) ? $this->options['environment'] : '';
+            $endpoint = 'https://' . $this->options['customerId'] . ".soap$env.afas.online/profitservices/$connector_path.asmx";
         }
 
         if (!empty($this->soapClient)) {
-            // We can reuse the SOAP client object if we have the same connector type
-            // as last time.
+            // We can reuse the SOAP client object if we have the same
+            // connector type as last time.
             if ($type === $this->connectorType) {
                 return $this->soapClient;
             }
@@ -133,30 +171,28 @@ class SoapAppClient
             // to change the WSDL for an object). So we create a new object.
         }
 
-        $options = $this->options;
+        $soap_client_options = $this->soapClientOptions;
         $wsdl_endpoint = null;
-        if (empty($options['useWSDL'])) {
-            $options += [
-                'location' => $endpoint,
+        if (empty($this->options['useWSDL'])) {
+            // 'location' cannot be overridden. This keeps things consistent
+            // with the code just above here.
+            $soap_client_options['location'] = $endpoint;
+            // It would be remarkable if the following options needed to be
+            // overridden (by passing them into the constructor) but in case
+            // AFAS changes their endpoint for some reason... you can try...
+            $soap_client_options += [
                 'uri' => 'urn:Afas.Profit.Services',
                 'style' => SOAP_DOCUMENT,
                 'use' => SOAP_LITERAL,
             ];
         } else {
             $wsdl_endpoint = $endpoint . '?WSDL';
-            if ($options['cacheWSDL']) {
-                ini_set('soap.wsdl_cache_ttl', $options['cacheWSDL']);
+            if ($this->options['cacheWSDL']) {
+                ini_set('soap.wsdl_cache_ttl', $this->options['cacheWSDL']);
             }
         }
 
-        // $options contains both SoapClient options and call/argument options
-        // used by this class. We shouldn't be passing the latter ones to our
-        // client, so we should be doing some filtering at this point. But since
-        // that's a bit hard to do generically now that we have a configurable
-        // soapClientClass, we'll try to get away with just passing everything,
-        // for now. (A previous version of the code contained a list of
-        // SoapClient / Curl options.)
-        $this->soapClient = new $options['soapClientClass']($wsdl_endpoint, $options);
+        $this->soapClient = new $this->options['soapClientClass']($wsdl_endpoint, $soap_client_options);
         $this->connectorType = $type;
 
         return $this->soapClient;
@@ -169,9 +205,7 @@ class SoapAppClient
      *
      * This class is not meant to make decisions about any actual data sent.
      * (That kind of code would belong in Connection.) So while we can
-     * _validate_ many arguments here, _setting_ them is discouraged; the
-     * arguments set here would typically be for e.g. authentication rather than
-     * data manipulation.
+     * validate many arguments here, setting them is discouraged.
      *
      * @param array $arguments
      *   Arguments for function. All argument names must be lower case.
@@ -191,37 +225,52 @@ class SoapAppClient
             $arguments['token'] = '<token><version>1</version><data>' . $this->options['appToken'] . '</data></token>';
         }
         if ($this->connectorType === 'get') {
-            // There are two issues with the 'skip' / 'take' arguments:
-            // - (For both getData and getDataWithOptions), the WSDL suggests
+            // Some issues with the 'skip' / 'take' arguments:
+            // - (For both getData and getDataWithOptions) the WSDL suggests
             //   they are both required, though testing says that it's perfectly
             //   OK to not specify 'skip'. However if 'take' is left out,
             //   nothing is returned, which suggests that it defaults to '0'
-            //   (which returns no data).
+            //   (which returns no data). For completeness: this differs from
+            //   the REST endpoint which returns 100 rows by default.
             // - There are actually two arguments which work: 'take', and a
             //   'take' option inside the 'option' argument (which means it's
-            //   encoded as "<take>N</take>"). Same for 'skip'. Testing shows
-            //   different behavior for the two variations:
-            //   - If the 'options' 'take' argument is -1, 1000 records are
-            //     returned. Also if a value > 1000 is specified, the output is
-            //     truncated silently to 1000 records. (If 0 is specified, no
+            //   encoded as "<take>N</take>"). Same for 'skip'. Testing (July
+            //   2017) shows different behavior for the two variations:
+            //   - If the 'options->take' argument is negative or greater than
+            //     1000, the output is capped at 1000 rows. (If it is 0, no
             //     data is returned, just like the regular argument.)
-            //   - If the regular 'take' argument is -1, a "Unexpected backend
-            //     error" is returned. If a value > 1000 is specified, the
-            //     specified number of records is returned.
+            //   - If the regular 'take' argument is negative, a "Unexpected
+            //     backend error" is returned. If it is greater than 1000, the
+            //     specified number of rows is returned.
             //   - If both are specified, the regular 'take' argument is used.
-            if (empty($arguments['take']) && (empty($arguments['options']) || stripos($arguments['options'], '<take>') === false)) {
+            // 'Skip' is slightly odd - the first point below is explicitly
+            // intended functionality and the others are likely not:
+            // - -1 overrides 'take'; 'take' isn't validated at all and the
+            //   full data set is returned (which could lead to timeouts). This
+            //   is true regardless which of the two types of 'skip/take'
+            //   arguments are passed.
+            // - A value smaller than -1 apparently works as 0 (no offset;
+            //   validate 'take') if 'take' is specified, and as -1 (return
+            //   full data set) if 'take' is not specified.
+            // - The regular 'skip' cannot be non-numeric, but the
+            //   'options->skip' argument can be, in which it is treated
+            //   equal to a value smaller than -1.
+            if ((empty($arguments['skip']) || $arguments['skip'] != -1)
+                && (empty($arguments['options']) || !preg_match('|<skip>\s*-1\s*</skip>|i', $arguments['options']))) {
                 // This class generally does not want to force any logic on the
                 // specified arguments, but since the behavior of returning
                 // nothing by default is confusing, we'll throw an exception if
                 // this is about to happen (which we do here, not in Connection,
                 // so people can't miss it).
-                throw new InvalidArgumentException("'take' argument must not be empty/zero, otherwise no results are returned.", 41);
-            }
-            if (isset($arguments['take']) && (!is_numeric($arguments['take']) || $arguments['take'] <= 0)) {
-                throw new InvalidArgumentException("'take' argument must be a positive number.", 42);
-            }
-            if (isset($arguments['skip']) && (!is_numeric($arguments['skip']) || $arguments['skip'] < 0)) {
-                throw new InvalidArgumentException("'skip' argument must be zero or larger.", 43);
+                if (empty($arguments['take']) && (empty($arguments['options']) || stripos($arguments['options'], '<take>') === false)) {
+                    throw new InvalidArgumentException("'take' argument must not be empty/zero, otherwise no results are returned.", 41);
+                }
+                // We'll validate the 'take' parameter rather than have AFAS
+                // return an error, because we can do a better job at the error
+                // message.
+                if (isset($arguments['take']) && !is_numeric($arguments['take'])) {
+                    throw new InvalidArgumentException("'take' argument must be a positive number.", 42);
+                }
             }
         }
 
@@ -233,10 +282,10 @@ class SoapAppClient
      *
      * @param string $type
      *   Type of connector: get / update / report / subject / data.
-     * @param string $function
+     * @param string $endpoint
      *   Function name to call.
      * @param array $arguments
-     *   Named function arguments. All values must be scalars. (Case of argument
+     *   Named arguments. All values must be scalars. (Case of argument
      *   names gets changed; if there are multiple arguments whose names only
      *   differ in case, then the value that is later in the array will override
      *   earlier arguments.)
@@ -253,7 +302,7 @@ class SoapAppClient
      * @throws \Exception
      *   For anything else that went wrong, e.g. initializing the SoapClient.
      */
-    public function callAfas($type, $function, array $arguments)
+    public function callAfas($type, $endpoint, array $arguments)
     {
         $type = strtolower($type);
         // Unify case of arguments, so we don't miss any mis-cased ones. (For
@@ -272,7 +321,7 @@ class SoapAppClient
 
         $client = $this->getSoapClient($type);
 
-        $arguments = $this->validateArguments($arguments, $function);
+        $arguments = $this->validateArguments($arguments, $endpoint);
 
         // The SOAP argument names are case sensitive so we need to turn them
         // back to valid ones.
@@ -293,28 +342,28 @@ class SoapAppClient
             }
             $params[] = new SoapVar($value, XSD_STRING, null, null, $name, 'urn:Afas.Profit.Services');
         }
-        $function_wrapper = new SoapVar($params, SOAP_ENC_OBJECT, null, null, $function, 'urn:Afas.Profit.Services');
-        $function_param = new SoapParam($function_wrapper, $function);
+        $function_wrapper = new SoapVar($params, SOAP_ENC_OBJECT, null, null, $endpoint, 'urn:Afas.Profit.Services');
+        $function_param = new SoapParam($function_wrapper, $endpoint);
 
         if (!empty($this->options['useWSDL'])) {
-            $response = $client->$function($function_param);
+            $response = $client->$endpoint($function_param);
         } else {
             // The above call would set the SOAPAction HTTP header to
             // "urn:Afas.Profit.Services#GetDataWithOptions". Call __soapCall()
             // directly (rather than indirectly through a 'magic function' as
             // above) so that we can modify arguments.
-            $response = $client->__soapCall($function, [$function_param], ['soapaction' => 'urn:Afas.Profit.Services/' . $function]);
+            $response = $client->__soapCall($endpoint, [$function_param], ['soapaction' => 'urn:Afas.Profit.Services/' . $endpoint]);
         }
 
         // See the WSDL definition: Every AFAS call returns a single-value
         // response with the single value always a string named XXXResult.
-        if (is_object($response) && isset($response->{"{$function}Result"})) {
-            return $response->{"{$function}Result"};
+        if (is_object($response) && isset($response->{"{$endpoint}Result"})) {
+            return $response->{"{$endpoint}Result"};
         } elseif (is_string($response)) {
             // WSDL-less call returns a string.
             return $response;
         } else {
-            throw new UnexpectedValueException('Unknown response format: ' . json_encode($response), 24);
+            throw new UnexpectedValueException('Unknown response format: ' . var_export($response, true), 24);
         }
     }
 }
